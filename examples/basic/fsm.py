@@ -1,5 +1,5 @@
 from migen import *
-from migen.fhdl import verilog
+from migen.fhdl import verilog, vhdl
 
 class Example(Module):
     def __init__(self):
@@ -29,3 +29,5 @@ class Example(Module):
 if __name__ == "__main__":
     example = Example()
     print(verilog.convert(example, {example.s, example.counter, example.be, example.ae, example.bl, example.al}))
+    example = Example()
+    print(vhdl.convert(example, {example.s, example.counter, example.be, example.ae, example.bl, example.al}))

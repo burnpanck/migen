@@ -1,5 +1,5 @@
 from migen import *
-
+from migen.fhdl import verilog, vhdl
 
 # Our simple counter, which increments at every cycle.
 class Counter(Module):
@@ -27,3 +27,8 @@ def counter_test(dut):
 if __name__ == "__main__":
     dut = Counter()
     run_simulation(dut, counter_test(dut), vcd_name="basic1.vcd")
+    dut = Counter()
+    print(verilog.convert(dut))
+    dut = Counter()
+    print(vhdl.convert(dut))
+
