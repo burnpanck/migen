@@ -30,4 +30,6 @@ if __name__ == "__main__":
     example = Example()
     print(verilog.convert(example, {example.s, example.counter, example.be, example.ae, example.bl, example.al}))
     example = Example()
-    print(vhdl.convert(example, {example.s, example.counter, example.be, example.ae, example.bl, example.al}))
+    code = vhdl.convert(example, {example.s, example.counter, example.be, example.ae, example.bl, example.al})
+    code.write(__file__+'.vhd')
+    print(code)
