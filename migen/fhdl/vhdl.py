@@ -1,5 +1,6 @@
 from functools import partial
 from operator import itemgetter
+import abc, itertools
 import collections
 
 from migen.fhdl.structure import *
@@ -8,28 +9,6 @@ from migen.fhdl.tools import *
 from migen.fhdl.visit import NodeTransformer
 from migen.fhdl.namer import build_namespace
 from migen.fhdl.conv_output import ConvOutput
-
-
-_reserved_keywords_verilog = {
-    "always", "and", "assign", "automatic", "begin", "buf", "bufif0", "bufif1",
-    "case", "casex", "casez", "cell", "cmos", "config", "deassign", "default",
-    "defparam", "design", "disable", "edge", "else", "end", "endcase",
-    "endconfig", "endfunction", "endgenerate", "endmodule", "endprimitive",
-    "endspecify", "endtable", "endtask", "event", "for", "force", "forever",
-    "fork", "function", "generate", "genvar", "highz0", "highz1", "if",
-    "ifnone", "incdir", "include", "initial", "inout", "input",
-    "instance", "integer", "join", "large", "liblist", "library", "localparam",
-    "macromodule", "medium", "module", "nand", "negedge", "nmos", "nor",
-    "noshowcancelled", "not", "notif0", "notif1", "or", "output", "parameter",
-    "pmos", "posedge", "primitive", "pull0", "pull1" "pulldown",
-    "pullup", "pulsestyle_onevent", "pulsestyle_ondetect", "remos", "real",
-    "realtime", "reg", "release", "repeat", "rnmos", "rpmos", "rtran",
-    "rtranif0", "rtranif1", "scalared", "showcancelled", "signed", "small",
-    "specify", "specparam", "strong0", "strong1", "supply0", "supply1",
-    "table", "task", "time", "tran", "tranif0", "tranif1", "tri", "tri0",
-    "tri1", "triand", "trior", "trireg", "unsigned", "use", "vectored", "wait",
-    "wand", "weak0", "weak1", "while", "wire", "wor","xnor", "xor"
-}
 
 _reserved_keywords = {
     "abs", "access", "after", "alias", "all", "and", "architecture", "array", "assert",
@@ -47,19 +26,41 @@ _reserved_keywords = {
 
 # -------------
 # VHDL types
-#  These classes represent the semantics of a type, not identity. Thus, the name of a type is not part of the class,
-# nor does identity of the objects mater.
 # -------------
 
-class VHDLType:
-    @property
-    def name(self):
-        return type(self).__name__
-
-    def matchable_to(self,other):
+class VHDLType(abc.ABC):
+    def __eq__(self,other):
         if not isinstance(other,VHDLType):
             return NotImplemented
-        return type(other) == type(self)
+        return type(other) == type(self) and self.name == other.name and self.equivalent_to(other)
+
+    @abc.abstractmethod
+    def equivalent_to(self,other):
+        pass
+
+    @abc.abstractmethod
+    def castable_to(self,other):
+        pass
+
+    def compatible_with(self,other):
+        return self.ultimate_base == other.ultimate_base
+
+    unconstrained = False
+
+    @property
+    def ultimate_base(self):
+        return self
+
+class VHDLSubtype(abc.ABC):
+    """ Mixin for subtypes
+    """
+    def __init__(self,base,name=None,*a,**kw):
+        self.base = base
+        super(VHDLSubtype).__init__(name,*a,**kw)
+
+    @property
+    def ultimate_base(self):
+        return self.base.ultimate_base
 
 class VHDLAccess(VHDLType):
     pass
@@ -67,114 +68,184 @@ class VHDLFile(VHDLType):
     pass
 
 class VHDLScalar(VHDLType):
+    @abc.abstractproperty
+    def length(self):
+        pass
+
+class VHDLInteger(VHDLScalar):
+    def __init__(self,name,left=None,right=None,ascending=None):
+        assert (left is None) == (right is None)
+        if ascending is None:
+            if left is not None:
+                ascending = not left>right
+        else:
+            assert left is not None
+            assert left == right or ascending == (left<right)
+        self.name = name
+        self.left = left
+        self.right = right
+        self.ascending = ascending
+
+    def __str__(self):
+        return '<%s:%s range %d %s %d>'%(self.name,self.ultimate_base.name,self.left,'to' if self.ascending else 'downto',self.right)
+
     @property
     def low(self):
         return min(self.left,self.right)
 
     @property
     def high(self):
-        return max(self.left, self.right)
-
-#    @abc.abstractproperty
-    def length(self):
-        pass
+        return max(self.left,self.right)
 
     @property
-    def ascending(self):
-        return self.left<self.right
-
-class VHDLInteger(VHDLScalar):
-    @property
     def length(self):
-        return abs(self.right - self.left)
+        return abs(self.left - self.right)
 
-    def constrained(self,left,right):
-        if hasattr(self,'left') or hasattr(self,'right'):
+    def constrain(self,left,right,name=None):
+        if self.left is not None:
             if self.ascending:
-                assert self.left<=left<right<=self.right
+                assert self.left<=left<=right<=self.right
             else:
-                assert self.left>=left>right>=self.right
-        ret = type(self)()
-        ret.left = left
-        ret.right = right
-        return ret
+                assert self.left>=left>=right>=self.right
+        return type(self)(name,left,right)
 
+    def equivalent_to(self,other):
+        return isinstance(other,VHDLInteger) and self.left==other.left and self.right==other.right and self.ascending==other.ascending
+
+    def castable_to(self,other):
+        # TODO: check if these are the correct requirements (does ascending need to match?)
+        return isinstance(other,VHDLInteger) and self.left>=other.left and self.right<=other.right and self.ascending==other.ascending
+
+class VHDLSubInteger(VHDLInteger,VHDLSubtype):
+    pass
 
 class VHDLReal(VHDLScalar):
     pass
 
 class VHDLEnumerated(VHDLScalar):
+    def __init__(self,name,values=()):
+        self.name = name
+        self.values = tuple(values)
+
+    def __str__(self):
+        return '<%s:%s(%s)>'%(self.name,self.ultimate_base.name,', '.join(str(v) for v in self.values))
+
+    @property
+    def left(self):
+        return self.values[0]
+
+    @property
+    def right(self):
+        return self.values[-1]
+
     @property
     def length(self):
         return len(self.values)
+
+    def equivalent_to(self,other):
+        return isinstance(other,VHDLEnumerated) and self.values==other.values
+
+    def castable_to(self,other):
+        return self.compatible_with(other)
+
+class VHDLSubEnum(VHDLEnumerated,VHDLSubtype):
+    pass
 
 class VHDLComposite(VHDLType):
     pass
 
 class VHDLArray(VHDLComposite):
-    def constrained(self,*indextypes):
-        assert not hasattr(self,'indextypes')
-        ret = type(self)()
-        if not hasattr(ret,'valuetype'):
-            ret.valuetype = self.valuetype
-        ret.indextypes = tuple(indextypes)
+    def __init__(self,name,valuetype,*indextypes):
+        self.name = name
+        self.valuetype = valuetype
+        self.indextypes = indextypes
 
-    def matchable_to(self, other):
-        if not self.valuetype.matchable_to(other.valuetype):
+    def __str__(self):
+        return '<%s:%s array (%s) of %s>'%(self.name,self.ultimate_base.name,', '.join(str(v) for v in self.indextypes),self.valuetype)
+
+    def constrain(self,name=None,*indextypes):
+        return VHDLSubArray(self,name,indextypes)
+
+    def __getitem__(self,item):
+        if isinstance(item,slice):
+            return self[(item,)]
+        if not len(self.indextypes) == len(item):
+            raise IndexError('You must specify a constraint for every index in an array specification')
+        return self.constrain(None,*[
+            t.constrain(
+                s.start if s.start is not None else t.left,
+                s.stop if s.stop is not None else t.right,
+            )
+            for t,s in zip(self.indextypes,item)
+        ])
+
+    def equivalent_to(self,other):
+        return (
+            isinstance(other,VHDLArray)
+            and self.valuetype.equivalent_to(other.valuetype)
+            and len(self.indextypes) == len(other.indextypes)
+            and all(s.equivalent_to(o) for s,o in zip(self.indextypes,other.indextypes))
+        )
+
+    def castable_to(self, other):
+        if not self.valuetype.castable_to(other.valuetype):
             return False
         if len(self.indextypes) != len(other.indextypes):
             return False
-        return all(s.matchable_to(o) for s,o in zip(self.indextypes, other.indextypes))
+        return all(s.castable_to(o) for s,o in zip(self.indextypes, other.indextypes))
+
+    unconstrained = True
+
+class VHDLSubArray(VHDLArray,VHDLSubtype):
+    unconstrained = False
+
+    def __init__(self,base,name,*indextypes):
+        if not len(base.indextypes) == len(indextypes) or not all(
+            s.compatible_with(b) for s,b in zip(
+                indextypes, base.indextypes
+            )
+        ):
+            raise TypeError('The index of an array subtype must be compatible with the index of the base array')
+        self.base = base
+        self.name = name
+        self.indextypes = indextypes
+
+    def constrain(self,name=None,*indextypes):
+        raise TypeError('Cannot constrain already constrained arrays')
+
+    @property
+    def valuetype(self):
+        return self.base.valuetype
 
 class VHDLRecord(VHDLComposite):
     pass
 
 
 # - Standard types
+bit = VHDLEnumerated('bit',(0,1))
+boolean = VHDLEnumerated('boolean',(False,True))
+character = VHDLEnumerated('character',tuple(chr(k) for k in range(32,128))) # TODO: verify correct set
 
-class bit(VHDLScalar):
-    values = ('0','1')
+integer = VHDLInteger('integer',-2**31+1,2**31-1)
+natural = VHDLInteger('natural',0,2**31-1)
+positive = VHDLInteger('positive',1,2**31-1)
 
-class bit_vector(VHDLArray):
-    valuetype = bit()
+severity_level = VHDLEnumerated('severity_level','note warning error failure'.split())
 
-class boolean(VHDLEnumerated):
-    values = (False,True)
+bit_vector = VHDLArray('bit_vector',bit,natural)
+string = VHDLArray('string',character,natural)
 
-class character(VHDLEnumerated):
-    values = tuple(chr(k) for k in range(256)) # TODO: verify true set
 
-class string(VHDLArray):
-    type = character()
-
-class integer(VHDLInteger):
-    left,right = (-2**31+1,2**31-1)
-
-class natural(VHDLInteger):
-    left,right = (0,2**31-1)
-
-class positive(VHDLInteger):
-    left,right = (1,2**31-1)
 
 # - std_logic_1164
+std_ulogic = VHDLEnumerated('std_ulogic',tuple('UX01ZWLH-'))
+std_logic = VHDLEnumerated('std_logic',tuple('UX01ZWLH-')) # TODO: implement resolution behaviour?
 
-class std_logic(VHDLEnumerated):
-    values = tuple(c for c in 'UX01ZWLH-')
+std_ulogic_vector = VHDLArray('std_ulogic_vector',std_ulogic,natural)
+std_logic_vector = VHDLArray('std_logic_vector',std_logic,natural)
+signed = VHDLArray('signed',std_logic,natural)
+unsigned = VHDLArray('unsigned',std_logic,natural)
 
-class std_logic_vector(VHDLArray):
-    valuetype = std_logic()
-    def __init__(self,*indextypes):
-        assert all(isinstance(t,VHDLScalar) for t in indextypes)
-        self.indextypes = indextypes
-    @classmethod
-    def make(cls,left,right):
-        return cls(VHDLInteger().constrained(left,right))
-
-class signed(std_logic_vector):
-    pass
-
-class unsigned(std_logic_vector):
-    pass
 
 # -------------------
 # VHDL-specific nodes
@@ -295,68 +366,119 @@ def _printcomb_verilog(f, ns,
     return r
 
 
-class TypeVisitor(NodeTransformer):
+Verilog2VHDL_operator_map = {v[0]:v[-1] for v in (v.split(':') for v in '''
+ &:and |:or ^:xor
+ < <= ==:= !=:/= > >=
+ <<:sll >>:srl <<<:sla >>>:sra
+ + -
+ *
+ ~:not
+'''.split())}
+
+if False:
+    def resize(type,expr,orig=None):
+        return 'resize('+expr+','+type.length+')', type
+    _types = (unsigned,signed,std_ulogic_vector,std_logic_vector)
+    standard_type_conversions = {(t,t):resize for t in _types}
+    standard_type_conversions.update({
+        (t,ot):resizeconvert for t,ot in itertools.product(_types,_types)
+        if t is not ot
+    })
+
+class VHDLExprPrinter(NodeTransformer):
+    def __init__(self,ns,signal_types,conversion_functions = {}):
+        self.ns = ns
+        self.signal_types = signal_types
+        self.conversion_functions = conversion_functions
+
+    def visit_as_type(self, node, type=None):
+        expr, orig_type = self.visit(node)
+        if orig_type.compatible_with(type):
+            return expr
+        if orig_type.castable_to(type):
+            assert type.name is not None   # or?
+            return type.name + '(' + expr + ')'
+        converter = self.conversion_functions.get((type.ultimate_base,orig_type.ultimate_base),None)
+        if converter is not None:
+            return converter(type,expr,orig_type)
+        if not isinstance(orig_type,VHDLArray):
+            raise TypeError("Don't know how to convert type %s to %s"%(orig_type,type))
+        # simply assume the presence of a resize function
+        expr = 'resize('+expr+','+type.length+')'
+        if not orig_type.valuetype.compatible_with(type.valuetype):
+            assert orig_type.castable_to(type.valuetype)
+            assert type.name is not None
+            expr = type.name+'('+expr+')'
+        return expr
+
     def visit_Constant(self, node):
-        return integer()
+        return str(node.value),integer.constrain(node.value,node.value)
 
     def visit_Signal(self, node):
-        if node.nbits==1:
-            return std_logic()
-        if node.signed:
-            return signed.make(node.nbits-1,0)
-        else:
-            return unsigned.make(node.nbits-1,0)
+        name = self.ns.get_name(node)
+        return name, self.signal_types[node]
 
     def visit_ClockSignal(self, node):
-        return std_logic()
+        return self.visit_Signal(node)
 
     def visit_ResetSignal(self, node):
-        return std_logic()
+        return self.visit_Signal(node)
 
     def visit_Operator(self, node):
-        if node.op in {'&','|','^'}:
-            # logical operators; in VHDL and,or,nand,nor,xor,xnor
-            left,right = [self.visit(o) for o in node.operands]
-            assert left.matchable_to(right)
-            return left
-        elif node.op in {'<','<=','==','!=','>','>='}:
-            # relational operators; in VHDL <, <=, =, /=, >, >=
-            left,right = [self.visit(o) for o in node.operands]
-            assert left.matchable_to(right)
-            return boolean()
-        elif node.op in {'<<<','>>>'}:
-            # shift operators; in VHDL sll,srl,sla,sra,rol,ror
-            left,right = [self.visit(o) for o in node.operands]
-            return left
-        elif node.op in {'+','-'} and len(node.operands)==2:
-            # addition operators; in VHDL +,-,&
-            left,right = [self.visit(o) for o in node.operands]
-            assert left.matchable_to(right)
-            return left
-        elif node.op in {'-'} and len(node.operands)==1:
-            # unary operators; in VHDL +,-
-            left, = [self.visit(o) for o in node.operands]
-            return left
-        elif node.op in {'*'}:
-            # multiplying operators; in VHDL *,/,mod,rem
-            left,right = [self.visit(o) for o in node.operands]
-            assert left.matchable_to(right)    # except when physical types are involved
-            return left
-        elif node.op in {'~'}:
-            # misc operators; in VHDL **,abs,not
-            left, = [self.visit(o) for o in node.operands]
-            return left
+        op = Verilog2VHDL_operator_map[node.op]  # TODO: op=='m'
+        if op in {'and','or','nand','nor','xor','xnor'}:
+            # logical operators
+            left,right = node.operands
+            lex,type = self.visit(left)
+            rex = self.visit_as_type(right,type)
+            return '('+lex + op + rex+')', type
+        elif op in {'<','<=','=','/=','>','>='}:
+            # relational operators
+            left,right = node.operands
+            lex,type = self.visit(left)
+            rex = self.visit_as_type(right,type)
+            return '('+lex + op + rex+')', boolean
+        elif op in {'sll','srl','sla','sra','rol','ror'}:
+            # shift operators
+            left,right = node.operands
+            lex,type = self.visit(left)
+            rex = self.visit_as_type(right,integer)
+            return '('+lex + op + rex+')', type
+        elif op in {'+','-'} and len(node.operands)==2:
+            # addition operators
+            left,right = node.operands
+            lex,type = self.visit(left)
+            rex = self.visit_as_type(right,left)
+            return '('+lex + op + rex+')', type
+        elif op in {'&'}:
+            # concatenation operator (same precedence as addition operators)
+            raise NotImplementedError
+        elif op in {'+','-'} and len(node.operands)==1:
+            # unary operators
+            right, = node.operands
+            ex,type = self.visit(right)
+            return '(' + op + ex+')', type
+        elif op in {'*','/','mod','rem'}:
+            # multiplying operators
+            raise NotImplementedError
+        elif op in {'**','abs','not'}:
+            # misc operators
+            raise NotImplementedError
         else:
             raise TypeError('Unknown operator "%s" with %d operands'*(node.op,len(node.operands)))
 
     def visit_Slice(self, node):
-        return _Slice(self.visit(node.value), node.start, node.stop)
+        expr,type = self.visit(node.value)
+        if not isinstance(type,VHDLArray):
+            raise TypeError('Cannot slice value of non-array type %s'%type)
+        idx, = type.indextypes
+        return expr + '(' + str(node.stop-1) + ' downto ' + str(node.start) + ')'
 
     def visit_Cat(self, node):
-        return Cat(*[self.visit(e) for e in node.l])
+        raise NotImplementedError
 
     def visit_Replicate(self, node):
-        return Replicate(self.visit(node.v), node.n)
+        raise NotImplementedError
 
     def visit_Assign(self, node):
         return self._cannot_visit(node)
@@ -385,12 +507,23 @@ class TypeVisitor(NodeTransformer):
         return self._cannot_visit(node)
 
     def _cannot_visit(self, node):
-        raise TypeError('Node of type "%s" has no corresponding VHDL type'%type(node).__name__)
+        raise TypeError('Node of type "%s" cannot be written as a VHDL expression'%type(node).__name__)
+
+class _MapProxy(object):
+    def __init__(self,getter):
+        self._getter = getter
+
+    def __getitem__(self,item):
+        return self._getter(item)
 
 class Converter:
-    def typeof(self,obj):
+    def typeof(self,sig):
         """ Calculate the VHDL type of a given expression/signal/variable. """
-        return TypeVisitor().visit(obj)
+        if len(sig)==1:
+            return std_logic
+        base = signed if sig.signed else unsigned
+        return base[len(sig)-1:0]
+
 
     def _printsig(self, ns, s, dir):
         n = ns.get_name(s) + ': ' + dir
@@ -404,80 +537,11 @@ class Converter:
             n += " std_logic"
         return n
 
-    def _printconstant(self, node):
-        if node.nbits == 1:
-            return "'" + str(node.value) + "'", False
-        v = node.value
-        if node.signed:
-            v += 1 << node.nbits
-        v = bin(v)[2:]
-        v = v.rjust(node.nbits - len(v), '0')
-        return '"' + v + '"', bool(node.signed)
-
     def _printexpr(self, ns, node, type=None):
+        printer = VHDLExprPrinter(ns,_MapProxy(self.typeof))
         if type is not None:
-            if not self.typeof(node).matchable_to(type):
-                val,nt = self._printexpr(ns,node,type=None)
-                return (type.name+'('+val+')'),nt
-        if isinstance(node, Constant):
-            return self._printconstant(node)
-        elif isinstance(node, Signal):
-            return ns.get_name(node), node.signed
-        elif isinstance(node, _Operator):
-            arity = len(node.operands)
-            r1, s1 = self._printexpr(ns, node.operands[0])
-            if arity == 1:
-                if node.op == "-":
-                    if s1:
-                        r = node.op + r1
-                    else:
-                        r = "-$signed({1'd0, " + r1 + "})"
-                    s = True
-                else:
-                    r = node.op + r1
-                    s = s1
-            elif arity == 2:
-                r2, s2 = self._printexpr(ns, node.operands[1])
-                if node.op not in ["<<<", ">>>"]:
-                    if s2 and not s1:
-                        r1 = "$signed({1'd0, " + r1 + "})"
-                    if s1 and not s2:
-                        r2 = "$signed({1'd0, " + r2 + "})"
-                r = r1 + " " + node.op + " " + r2
-                s = s1 or s2
-            elif arity == 3:
-                assert node.op == "m"
-                r2, s2 = self._printexpr(ns, node.operands[1])
-                r3, s3 = self._printexpr(ns, node.operands[2])
-                if s2 and not s3:
-                    r3 = "$signed({1'd0, " + r3 + "})"
-                if s3 and not s2:
-                    r2 = "$signed({1'd0, " + r2 + "})"
-                r = r1 + " ? " + r2 + " : " + r3
-                s = s2 or s3
-            else:
-                raise TypeError
-            return "(" + r + ")", s
-        elif isinstance(node, _Slice):
-            # Verilog does not like us slicing non-array signals...
-            if isinstance(node.value, Signal) \
-                    and len(node.value) == 1 \
-                    and node.start == 0 and node.stop == 1:
-                return self._printexpr(ns, node.value)
-
-            if node.start + 1 == node.stop:
-                sr = "[" + str(node.start) + "]"
-            else:
-                sr = "[" + str(node.stop - 1) + ":" + str(node.start) + "]"
-            r, s = self._printexpr(ns, node.value)
-            return r + sr, s
-        elif isinstance(node, Cat):
-            l = [self._printexpr(ns, v)[0] for v in reversed(node.l)]
-            return "{" + ", ".join(l) + "}", False
-        elif isinstance(node, Replicate):
-            return "{" + str(node.n) + "{" + self._printexpr(ns, node.v)[0] + "}}", False
-        else:
-            raise TypeError("Expression of unrecognized type: '{}'".format(type(node).__name__))
+            return printer.visit_as_type(node,type)
+        return printer.visit(node)[0]
 
     def _printnode(self, ns, at, level, node):
         if isinstance(node, _Assign):
@@ -521,10 +585,10 @@ class Converter:
 
     def _printuse(self):
         r = """
-    library ieee;
-    use ieee.std_logic_1164.all;
-    use ieee.numeric_std.all;
-        """
+library ieee;
+use ieee.std_logic_1164.all;
+use ieee.numeric_std.all;
+"""
         return r
 
     def _printentitydecl(self, f, ios, name, ns,
@@ -536,15 +600,15 @@ class Converter:
         wires = _list_comb_wires(f) | special_outs
 
         r = """
-    entity {name} is
-        port(
-    """.format(name=name)
+entity {name} is
+\tport(
+""".format(name=name)
         r += ';\n'.join(
-            ' ' * 8 + self._printsig(ns, sig, 'inout' if sig in inouts else 'out' if sig in targets else 'in')
+            '\t' * 2 + self._printsig(ns, sig, 'inout' if sig in inouts else 'out' if sig in targets else 'in')
             for sig in sorted(ios, key=lambda x: x.duid)
         )
         r += """\n);
-    end {name};
+end {name};
     """.format(name=name)
         return r
 
