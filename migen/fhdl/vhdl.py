@@ -29,10 +29,19 @@ _reserved_keywords = {
 # -------------
 
 class VHDLType(abc.ABC):
+    _identity = ('name',)
+
     def __eq__(self,other):
         if not isinstance(other,VHDLType):
             return NotImplemented
-        return type(other) == type(self) and self.name == other.name and self.equivalent_to(other)
+        return type(other) == type(self) and self._prehash == other._prehash
+
+    @property
+    def _prehash(self):
+        return tuple(getattr(self,attr) for attr in type(self)._identity)
+
+    def __hash__(self):
+        return hash(self._prehash)
 
     @abc.abstractmethod
     def equivalent_to(self,other):
@@ -56,7 +65,7 @@ class VHDLSubtype(abc.ABC):
     """
     def __init__(self,base,name=None,*a,**kw):
         self.base = base
-        super(VHDLSubtype).__init__(name,*a,**kw)
+        super(VHDLSubtype,self).__init__(name,*a,**kw)
 
     @property
     def ultimate_base(self):
@@ -73,6 +82,7 @@ class VHDLScalar(VHDLType):
         pass
 
 class VHDLInteger(VHDLScalar):
+    _identity = ('name','left','right','ascending')
     def __init__(self,name,left=None,right=None,ascending=None):
         assert (left is None) == (right is None)
         if ascending is None:
@@ -99,15 +109,16 @@ class VHDLInteger(VHDLScalar):
 
     @property
     def length(self):
-        return abs(self.left - self.right)
+        return max(0,
+            (self.right - self.left + 1)
+            if self.ascending else
+            (self.left - self.right + 1)
+        )
 
-    def constrain(self,left,right,name=None):
+    def constrain(self,left,right,ascending=None,name=None):
         if self.left is not None:
-            if self.ascending:
-                assert self.left<=left<=right<=self.right
-            else:
-                assert self.left>=left>=right>=self.right
-        return type(self)(name,left,right)
+            assert self.low <= min(left,right) and max(left,right)<=self.high
+        return VHDLSubInteger(self,name,left,right,ascending)
 
     def equivalent_to(self,other):
         return isinstance(other,VHDLInteger) and self.left==other.left and self.right==other.right and self.ascending==other.ascending
@@ -116,13 +127,14 @@ class VHDLInteger(VHDLScalar):
         # TODO: check if these are the correct requirements (does ascending need to match?)
         return isinstance(other,VHDLInteger) and self.left>=other.left and self.right<=other.right and self.ascending==other.ascending
 
-class VHDLSubInteger(VHDLInteger,VHDLSubtype):
+class VHDLSubInteger(VHDLSubtype,VHDLInteger):
     pass
 
 class VHDLReal(VHDLScalar):
     pass
 
 class VHDLEnumerated(VHDLScalar):
+    _identity = ('name','values')
     def __init__(self,name,values=()):
         self.name = name
         self.values = tuple(values)
@@ -148,13 +160,14 @@ class VHDLEnumerated(VHDLScalar):
     def castable_to(self,other):
         return self.compatible_with(other)
 
-class VHDLSubEnum(VHDLEnumerated,VHDLSubtype):
+class VHDLSubEnum(VHDLSubtype,VHDLEnumerated):
     pass
 
 class VHDLComposite(VHDLType):
     pass
 
 class VHDLArray(VHDLComposite):
+    _identity = ('name','valuetype','indextypes')
     def __init__(self,name,valuetype,*indextypes):
         self.name = name
         self.valuetype = valuetype
@@ -164,7 +177,7 @@ class VHDLArray(VHDLComposite):
         return '<%s:%s array (%s) of %s>'%(self.name,self.ultimate_base.name,', '.join(str(v) for v in self.indextypes),self.valuetype)
 
     def constrain(self,name=None,*indextypes):
-        return VHDLSubArray(self,name,indextypes)
+        return VHDLSubArray(self,name,*indextypes)
 
     def __getitem__(self,item):
         if isinstance(item,slice):
@@ -196,7 +209,7 @@ class VHDLArray(VHDLComposite):
 
     unconstrained = True
 
-class VHDLSubArray(VHDLArray,VHDLSubtype):
+class VHDLSubArray(VHDLSubtype,VHDLArray):
     unconstrained = False
 
     def __init__(self,base,name,*indextypes):
@@ -375,21 +388,29 @@ Verilog2VHDL_operator_map = {v[0]:v[-1] for v in (v.split(':') for v in '''
  ~:not
 '''.split())}
 
-if False:
-    def resize(type,expr,orig=None):
-        return 'resize('+expr+','+type.length+')', type
-    _types = (unsigned,signed,std_ulogic_vector,std_logic_vector)
-    standard_type_conversions = {(t,t):resize for t in _types}
-    standard_type_conversions.update({
-        (t,ot):resizeconvert for t,ot in itertools.product(_types,_types)
-        if t is not ot
-    })
+def conv(format):
+    def convert(type,expr,orig=None):
+        return format.format(
+            x=expr,
+            l=type.indextypes[0].length if isinstance(type,VHDLArray) else None,
+        )
+    return convert
+standard_type_conversions = {
+    (integer,signed):conv('to_integer({x})'),
+    (integer,unsigned):conv('to_integer({x})'),
+    (signed,integer):conv('to_signed({x},{l})'),
+    (unsigned,integer):conv('to_unsigned({x},{l})'),
+    (std_logic,integer):conv('({x} /= 0)'),
+    (boolean,std_logic):conv("({x} = '1')"),
+}
 
 class VHDLExprPrinter(NodeTransformer):
     def __init__(self,ns,signal_types,conversion_functions = {}):
         self.ns = ns
         self.signal_types = signal_types
-        self.conversion_functions = conversion_functions
+        tmp = dict(standard_type_conversions)
+        tmp.update(conversion_functions)
+        self.conversion_functions = tmp
 
     def visit_as_type(self, node, type=None):
         expr, orig_type = self.visit(node)
@@ -448,7 +469,7 @@ class VHDLExprPrinter(NodeTransformer):
             # addition operators
             left,right = node.operands
             lex,type = self.visit(left)
-            rex = self.visit_as_type(right,left)
+            rex = self.visit_as_type(right,type)
             return '('+lex + op + rex+')', type
         elif op in {'&'}:
             # concatenation operator (same precedence as addition operators)
@@ -472,7 +493,7 @@ class VHDLExprPrinter(NodeTransformer):
         if not isinstance(type,VHDLArray):
             raise TypeError('Cannot slice value of non-array type %s'%type)
         idx, = type.indextypes
-        return expr + '(' + str(node.stop-1) + ' downto ' + str(node.start) + ')'
+        return expr + '(' + str(node.stop-1) + ' downto ' + str(node.start) + ')', type[node.stop-1:node.start]
 
     def visit_Cat(self, node):
         raise NotImplementedError
@@ -553,12 +574,13 @@ class Converter:
                 assignment = " := "
             else:
                 assignment = " <= "
-            left,right = [self.typeof(o) for o in [node.l,node.r]]
-            return "\t" * level + self._printexpr(ns, node.l)[0] + assignment + self._printexpr(ns, node.r, type=left)[0] + ";\n"
+            assert isinstance(node.l,Signal)
+            left = self.typeof(node.l)
+            return "\t" * level + self._printexpr(ns, node.l) + assignment + self._printexpr(ns, node.r, type=left) + ";\n"
         elif isinstance(node, collections.Iterable):
             return "".join(list(map(partial(self._printnode, ns, at, level), node)))
         elif isinstance(node, If):
-            r = "\t" * level + "if (" + self._printexpr(ns, node.cond)[0] + ") = '1' then\n"
+            r = "\t" * level + "if " + self._printexpr(ns, node.cond, boolean) + " then\n"
             r += self._printnode(ns, at, level + 1, node.t)
             if node.f:
                 r += "\t" * level + "else\n"
@@ -567,11 +589,11 @@ class Converter:
             return r
         elif isinstance(node, Case):
             if node.cases:
-                r = "\t" * level + "case (" + self._printexpr(ns, node.test)[0] + ") is \n"
+                r = "\t" * level + "case " + self._printexpr(ns, node.test) + " is \n"
                 css = [(k, v) for k, v in node.cases.items() if isinstance(k, Constant)]
                 css = sorted(css, key=lambda x: x[0].value)
                 for choice, statements in css:
-                    r += "\t" * (level + 1) + "when (" + self._printexpr(ns, choice)[0] + ") =>\n"
+                    r += "\t" * (level + 1) + "when " + self._printexpr(ns, choice) + " =>\n"
                     r += self._printnode(ns, at, level + 2, statements)
                 if "default" in node.cases:
                     r += "\t" * (level + 1) + "when others => \n"

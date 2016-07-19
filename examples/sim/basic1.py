@@ -28,7 +28,7 @@ if __name__ == "__main__":
     dut = Counter()
     run_simulation(dut, counter_test(dut), vcd_name="basic1.vcd")
     dut = Counter()
-    print(verilog.convert(dut))
+    print(verilog.convert(dut,{dut.count}))
     dut = Counter()
-    print(vhdl.convert(dut))
+    print(vhdl.convert(dut,{dut.count}))
 
