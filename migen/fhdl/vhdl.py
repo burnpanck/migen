@@ -821,6 +821,37 @@ begin
 end {name};
 
 architecture Migen of {name} is
+
+procedure clk_gen(
+    signal clk : out std_logic;
+    constant half_period : time;
+    signal run : std_logic := '1';
+    constant first_edge : time := half_period;
+    constant initial_level: std_logic := '0'
+) is
+begin
+  -- Check the arguments
+  assert (half_period /= 0 fs) report "clk_gen: half_period is zero; time resolution to large for frequency" severity FAILURE;
+  -- Initial phase shift
+  clk <= initial_level;
+  wait for first_edge;
+  if initial_level /= '0' then
+    clk <= '0';
+    wait for half_period;
+  end if;
+  -- Generate cycles
+  loop
+    -- Only high pulse if run is '1' or 'H'
+    if (run = '1') or (run = 'H') then
+      clk <= run;
+    end if;
+    wait for half_period;
+    -- Low part of cycle
+    clk <= '0';
+    wait for half_period;
+  end loop;
+end procedure;
+
 component {dut}
 \tport({dutport});
 end component;
@@ -843,16 +874,12 @@ begin
 
         for k in sorted(list_clock_domains(f)):
             clk = time.clocks[k]
-            if clk.high or clk.time_before_trans != clk.half_period:
-                raise NotImplementedError('phase shifted clocks')
-            src += """{name}_clksrc: process
-begin
-wait for {dt} ns;
-{name}_clk <= '1';
-wait for {dt} ns;
-{name}_clk <= '0';
-end process;
-""".format(name=k,dt=clk.half_period)
+            src += """clk_gen({name}_clk, {dt} ns, '1', {first_dt} ns, {initial}); """.format(
+                name=k,
+                dt=clk.half_period,
+                first_dt=clk.time_before_trans,
+                initial="'1'" if clk.high else "'0'",
+            )
 
         src += 'end;\n'
 
