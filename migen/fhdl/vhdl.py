@@ -400,7 +400,8 @@ standard_type_conversions = {
     (integer,unsigned):conv('to_integer({x})'),
     (signed,integer):conv('to_signed({x},{l})'),
     (unsigned,integer):conv('to_unsigned({x},{l})'),
-    (std_logic,integer):conv('({x} /= 0)'),
+    (boolean,integer):conv('({x} /= 0)'),
+    (std_logic,integer):conv("to_std_ulogic({x})"),  # TODO: Only works in signal assignments
     (boolean,std_logic):conv("({x} = '1')"),
 }
 
@@ -413,7 +414,19 @@ class VHDLExprPrinter(NodeTransformer):
         self.conversion_functions = tmp
 
     def visit_as_type(self, node, type=None):
-        expr, orig_type = self.visit(node)
+        visited = None
+        if False:
+            if isinstance(node,Constant):
+                # constant shortcut: avoid type converted constants in output
+                cp = literal_printers.get(type.ultimate_base, None)
+                if cp is not None:
+                    l = type.indextypes[0].length if isinstance(type,VHDLArray) else None
+                    visited = cp(node.value,l)
+        if visited is None:
+            visited = self.visit(node)
+        # check for type conversions
+        expr, orig_type = visited
+        print(expr, orig_type, type)
         if orig_type.compatible_with(type):
             return expr
         if orig_type.castable_to(type):
@@ -425,7 +438,7 @@ class VHDLExprPrinter(NodeTransformer):
         if not isinstance(orig_type,VHDLArray):
             raise TypeError("Don't know how to convert type %s to %s"%(orig_type,type))
         # simply assume the presence of a resize function
-        expr = 'resize('+expr+','+type.length+')'
+        expr = 'resize('+expr+','+str(type.indextypes[0].length)+')'
         if not orig_type.valuetype.compatible_with(type.valuetype):
             assert orig_type.castable_to(type.valuetype)
             assert type.name is not None
@@ -537,6 +550,13 @@ class _MapProxy(object):
     def __getitem__(self,item):
         return self._getter(item)
 
+
+literal_printers = {
+    integer: lambda v, l: str(None),
+    unsigned: lambda v, l: '"' + bin(v)[2:].rjust(l, '0') + '"',
+    signed: lambda v, l: '"' + bin(v & ~-(1 << l))[2:].rjust(l, '0') + '"',
+}
+
 class Converter:
     def typeof(self,sig):
         """ Calculate the VHDL type of a given expression/signal/variable. """
@@ -545,6 +565,13 @@ class Converter:
         base = signed if sig.signed else unsigned
         return base[len(sig)-1:0]
 
+    def _printliteral(self, node, type):
+        assert isinstance(node,Constant)
+        cp = literal_printers.get(type.ultimate_base, None)
+        if cp is None:
+            raise TypeError("Don't know how to print a constant of type %s"%type)
+        l = type.indextypes[0].length if isinstance(type, VHDLArray) else None
+        return cp(node.value, l)
 
     def _printsig(self, ns, s, dir):
         n = ns.get_name(s) + ': ' + dir
@@ -574,6 +601,7 @@ class Converter:
                 assignment = " := "
             else:
                 assignment = " <= "
+            assignment = " <= "
             assert isinstance(node.l,Signal)
             left = self.typeof(node.l)
             return "\t" * level + self._printexpr(ns, node.l) + assignment + self._printexpr(ns, node.r, type=left) + ";\n"
@@ -589,11 +617,14 @@ class Converter:
             return r
         elif isinstance(node, Case):
             if node.cases:
-                r = "\t" * level + "case " + self._printexpr(ns, node.test) + " is \n"
+                printer = VHDLExprPrinter(ns, _MapProxy(self.typeof))
+                test,type = printer.visit(node.test)
+
+                r = "\t" * level + "case " + test + " is \n"
                 css = [(k, v) for k, v in node.cases.items() if isinstance(k, Constant)]
                 css = sorted(css, key=lambda x: x[0].value)
                 for choice, statements in css:
-                    r += "\t" * (level + 1) + "when " + self._printexpr(ns, choice) + " =>\n"
+                    r += "\t" * (level + 1) + "when " + self._printliteral(choice, type) + " =>\n"
                     r += self._printnode(ns, at, level + 2, statements)
                 if "default" in node.cases:
                     r += "\t" * (level + 1) + "when others => \n"
@@ -610,6 +641,37 @@ class Converter:
 library ieee;
 use ieee.std_logic_1164.all;
 use ieee.numeric_std.all;
+
+package migen_helpers is
+function to_std_ulogic(v: boolean) return std_ulogic;
+function to_std_ulogic(v: integer) return std_ulogic;
+end migen_helpers;
+
+package body migen_helpers is
+function to_std_ulogic(v: boolean) return std_ulogic is
+begin
+  if v then
+    return '1';
+  else
+    return '0';
+  end if;
+end to_std_ulogic;
+
+function to_std_ulogic(v: integer) return std_ulogic is
+begin
+  if v /= 0 then
+    return '1';
+  else
+    return '0';
+  end if;
+end to_std_ulogic;
+end migen_helpers;
+
+library ieee;
+use ieee.std_logic_1164.all;
+use ieee.numeric_std.all;
+use work.migen_helpers.all;
+
 """
         return r
 
@@ -620,13 +682,12 @@ use ieee.numeric_std.all;
         inouts = list_special_ios(f, False, False, True)
         targets = list_targets(f) | special_outs
         wires = _list_comb_wires(f) | special_outs
-
         r = """
 entity {name} is
 \tport(
 """.format(name=name)
         r += ';\n'.join(
-            '\t' * 2 + self._printsig(ns, sig, 'inout' if sig in inouts else 'out' if sig in targets else 'in')
+            '\t' * 2 + self._printsig(ns, sig, 'inout' if sig in inouts else 'buffer' if sig in targets else 'in')
             for sig in sorted(ios, key=lambda x: x.duid)
         )
         r += """\n);
