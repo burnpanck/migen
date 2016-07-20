@@ -1,5 +1,9 @@
+from io import StringIO
+import subprocess
+
 from migen import *
 from migen.fhdl import verilog, vhdl
+from migen.sim.ghdl import generate_vcd
 
 # Our simple counter, which increments at every cycle.
 class Counter(Module):
@@ -23,49 +27,26 @@ def counter_test(dut):
         yield  # next clock cycle
     # simulation ends with this generator
 
-vhdl_testbench = """
--- counter testbench
-library ieee;
-use ieee.std_logic_1164.all;
-use ieee.numeric_std.all;
-
-entity counter_tb is
-end counter_tb;
-
-architecture test of counter_tb is
-component top
-  port ( count: buffer unsigned (3 downto 0); sys_clk, sys_rst: std_logic);
-end component;
-signal cnt: unsigned (3 downto 0);
-signal rst, clk: std_logic;
-begin
-dut: top port map (count=>cnt, sys_clk=>clk, sys_rst=>rst);
-process
-begin
-  clk <= '0';
-  rst <= '1';
-  wait for 10 ns;
-  rst <= '0';
-  wait for 10 ns;
-  for i in 0 to 20 loop
-    clk <= '1';
-    wait for 10 ns;
-    clk <= '0';
-    wait for 10 ns;
-  end loop;
-  wait; -- wait forever; this will finish the simulation
-end process;
-end test;
-"""
 
 if __name__ == "__main__":
+    print('*** Simulating model using Migen')
     dut = Counter()
     run_simulation(dut, counter_test(dut), vcd_name="basic1.vcd")
+    print('*** Converting model to Verilog')
     dut = Counter()
     print(verilog.convert(dut,{dut.count}))
+    print('*** Converting model to VHDL')
     dut = Counter()
     out = vhdl.convert(dut,{dut.count})
-    out.main_source += vhdl_testbench
+    out.main_source += vhdl.Converter().generate_testbench(out)
     out.write(__file__+'.vhd')
     print(out)
-
+    print('*** Simulating model using GHDL')
+    try:
+        ghdl_version = subprocess.check_output(['ghdl','--version'])
+    except FileNotFoundError as ex:
+        print('Unable to find GHDL, cannot run VHDL simulation: ',ex)
+    else:
+        print('GHDL version: ',ghdl_version)
+        vcd = generate_vcd([__file__+'.vhd'],'top_testbench',t='200ns')
+        print(vcd)

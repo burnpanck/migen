@@ -31,5 +31,6 @@ if __name__ == "__main__":
     print(verilog.convert(example, {example.s, example.counter, example.be, example.ae, example.bl, example.al}))
     example = Example()
     code = vhdl.convert(example, {example.s, example.counter, example.be, example.ae, example.bl, example.al})
+    code.main_source += vhdl.Converter().generate_testbench(code)
     code.write(__file__+'.vhd')
     print(code)

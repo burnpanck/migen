@@ -426,7 +426,6 @@ class VHDLExprPrinter(NodeTransformer):
             visited = self.visit(node)
         # check for type conversions
         expr, orig_type = visited
-        print(expr, orig_type, type)
         if orig_type.compatible_with(type):
             return expr
         if orig_type.castable_to(type):
@@ -555,6 +554,7 @@ literal_printers = {
     integer: lambda v, l: str(None),
     unsigned: lambda v, l: '"' + bin(v)[2:].rjust(l, '0') + '"',
     signed: lambda v, l: '"' + bin(v & ~-(1 << l))[2:].rjust(l, '0') + '"',
+    std_logic: lambda v, l: "'1'" if v else "'0'",
 }
 
 class Converter:
@@ -566,14 +566,14 @@ class Converter:
         return base[len(sig)-1:0]
 
     def _printliteral(self, node, type):
-        assert isinstance(node,Constant)
+        assert isinstance(node, Constant), "Choices in case statements must be constants"
         cp = literal_printers.get(type.ultimate_base, None)
         if cp is None:
             raise TypeError("Don't know how to print a constant of type %s"%type)
         l = type.indextypes[0].length if isinstance(type, VHDLArray) else None
         return cp(node.value, l)
 
-    def _printsig(self, ns, s, dir):
+    def _printsig(self, ns, s, dir, initialise=False):
         n = ns.get_name(s) + ': ' + dir
         if len(s) > 1:
             if s.signed:
@@ -583,6 +583,8 @@ class Converter:
             n += "(" + str(len(s) - 1) + " downto 0)";
         else:
             n += " std_logic"
+        if initialise:
+            n += ' := ' + self._printliteral(s.reset, self.typeof(s))
         return n
 
     def _printexpr(self, ns, node, type=None):
@@ -687,7 +689,7 @@ entity {name} is
 \tport(
 """.format(name=name)
         r += ';\n'.join(
-            '\t' * 2 + self._printsig(ns, sig, 'inout' if sig in inouts else 'buffer' if sig in targets else 'in')
+            '\t' * 2 + self._printsig(ns, sig, 'inout' if sig in inouts else 'buffer' if sig in targets else 'in', initialise=True)
             for sig in sorted(ios, key=lambda x: x.duid)
         )
         r += """\n);
@@ -706,16 +708,16 @@ end {name};
     architecture Migen of {name} is
     """.format(name=name)
         r += '\n'.join(
-            ' ' * 4 + 'signal ' + self._printsig(ns, sig, '') + ';'
+            ' ' * 4 + 'signal ' + self._printsig(ns, sig, '', initialise=True) + ';'
             for sig in sorted(sigs - ios, key=lambda x: x.duid)
         )
         r += "\nbegin\n"
         return r
 
-    def _printsync(self, f, ns):
+    def _printsync(self, f, name, ns):
         r = ""
         for k, v in sorted(f.sync.items(), key=itemgetter(0)):
-            r += "WENEEDANAME: process (" + ns.get_name(f.clock_domains[k].clk) + ")\nbegin\n"
+            r += name+'_'+k+": process (" + ns.get_name(f.clock_domains[k].clk) + ")\nbegin\n"
             r += self._printnode(ns, _AT_SIGNAL, 1, v)
             r += "end process;\n\n"
         return r
@@ -729,6 +731,8 @@ end {name};
             f = f.get_fragment()
         if ios is None:
             ios = set()
+        r.fragment = f
+        r.name = name
 
         for cd_name in sorted(list_clock_domains(f)):
             try:
@@ -741,11 +745,15 @@ end {name};
                 else:
                     raise KeyError("Unresolved clock domain: '"+cd_name+"'")
 
+        r.ios = ios
+
         f = lower_complex_slices(f)
         insert_resets(f)
         f = lower_basics(f)
         fs, lowered_specials = lower_specials(special_overrides, f.specials)
         f += lower_basics(fs)
+
+        r.lowered_fragment = f
 
         for io in sorted(ios, key=lambda x: x.duid):
             if io.name_override is None:
@@ -762,7 +770,7 @@ end {name};
         src += self._printuse()
         src += self._printentitydecl(f, ios, name, ns, reg_initialization=not asic_syntax)
         src += self._printarchitectureheader(f, ios, name, ns, reg_initialization=not asic_syntax)
-        src += self._printsync(f, ns)
+        src += self._printsync(f, name, ns)
         src += "end Migen;\n"
         if False:
             src += _printheader_verilog(f, ios, name, ns,
@@ -777,6 +785,78 @@ end {name};
         r.set_main_source(src)
 
         return r
+
+    def generate_testbench(self, code, clocks={'sys':10}):
+        """ Genertes a testbench that does nothing but instantiate the DUT and run it's clocks.
+
+        The testbench does not generate any reset signals.
+
+        You must supply the result of a previous conversion.
+        """
+        from ..sim.core import TimeManager
+
+        name = code.name
+        ns = code.ns
+        f = code.lowered_fragment
+        ios = code.ios
+
+        tbname = name + '_testbench'
+
+        sigs = list_signals(f) | list_special_ios(f, True, True, True)
+        special_outs = list_special_ios(f, False, True, True)
+        inouts = list_special_ios(f, False, False, True)
+        targets = list_targets(f) | special_outs
+        wires = _list_comb_wires(f) | special_outs
+
+        time = TimeManager(clocks)
+
+        sortedios = sorted(ios, key=lambda x: x.duid)
+        src = """
+library ieee;
+use ieee.std_logic_1164.all;
+use ieee.numeric_std.all;
+
+entity {name} is
+begin
+end {name};
+
+architecture Migen of {name} is
+component {dut}
+\tport({dutport});
+end component;
+{signaldecl}
+begin
+\tdut: {dut} port map ({portmap});
+""".format(
+            name=tbname,
+            dut=name,
+            dutport=';\n\t\t'.join(
+                self._printsig(ns, sig, 'inout' if sig in inouts else 'buffer' if sig in targets else 'in', initialise=False)
+                for sig in sortedios
+            ),
+            signaldecl=''.join(
+                'signal ' + self._printsig(ns, sig, '', initialise=True) + ';\n'
+                for sig in sortedios
+            ),
+            portmap=', '.join(ns.get_name(s) for s in sortedios),
+        )
+
+        for k in sorted(list_clock_domains(f)):
+            clk = time.clocks[k]
+            if clk.high or clk.time_before_trans != clk.half_period:
+                raise NotImplementedError('phase shifted clocks')
+            src += """{name}_clksrc: process
+begin
+wait for {dt} ns;
+{name}_clk <= '1';
+wait for {dt} ns;
+{name}_clk <= '0';
+end process;
+""".format(name=k,dt=clk.half_period)
+
+        src += 'end;\n'
+
+        return src
 
 def convert(f, ios=None, name="top", special_overrides={}, create_clock_domains=True, display_run=False, asic_syntax=False):
     return Converter().convert(f,ios,name,special_overrides,create_clock_domains,display_run,asic_syntax)
