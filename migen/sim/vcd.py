@@ -86,7 +86,7 @@ def VCD_events(fh):
     """
     import re
     signals = {}
-    mult = 0
+    mult = 1
     num_sigs = None
     hier = []
     time = 0
@@ -164,3 +164,18 @@ def VCD_events(fh):
             else:
                 raise ValueError('Unable to parse line "%s"'%line)
             yield (code, value)
+
+def split_signals(src):
+    ret = {}
+    t = None
+    for e in src:
+        if isinstance(e,int):
+            t = e
+            continue
+        if isinstance(e,tuple):
+            s,l = e
+            ta,la = ret.setdefault(s,([],[]))
+            ta.append(t)
+            la.append(l)
+            continue
+    return ret
