@@ -8,3 +8,5 @@ from migen.sim import *
 
 from migen.genlib.record import *
 from migen.genlib.fsm import *
+
+from migen.version import __version__
