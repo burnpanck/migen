@@ -60,3 +60,9 @@ class SyntaxCase(unittest.TestCase):
             "-Wno-WIDTH",  # XXX should we improve ASIC backend to remove this?
         ]
         self.base_test("asic", True, options)
+
+
+    def test_conversion(self):
+        # TODO: integrate this test into a proper subclass of SimCase
+        from migen.test.support import SimCase
+        SimCase().convert_run_and_compare(SyntaxModule, cycles=10)

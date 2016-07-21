@@ -26,3 +26,26 @@ class DivisionCase(SimCase, unittest.TestCase):
                         self.assertEqual((yield self.tb.dut.quotient_o), dividend//divisor)
                         self.assertEqual((yield self.tb.dut.remainder_o), dividend%divisor)
         self.run_with(gen())
+
+    class TestBenchWithStimulus(Module):
+        def __init__(self):
+            self.submodules.dut = dut = Divider(4)
+            self.divident = dividend = Signal(4)
+            self.divisor = divisor = Signal(1,reset=1)
+            self.sync += If(
+                dut.ready_o,
+                dut.start_i.eq(1),
+            ).Elif(
+                dut.start_i,
+                dut.start_i.eq(0),
+                If(
+                    divisor == 15,
+                    divisor.eq(1),
+                    dividend.eq(dividend + 1),
+                ).Else(
+                    divisor.eq(divisor + 1)
+                )
+            )
+
+    def test_conversion(self):
+        self.convert_run_and_compare(self.TestBenchWithStimulus,cycles=15*16*5)

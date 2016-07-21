@@ -201,7 +201,7 @@ class VHDLArray(VHDLComposite):
         )
 
     def castable_to(self, other):
-        if not self.valuetype.castable_to(other.valuetype):
+        if not isinstance(other, VHDLArray) or not self.valuetype.castable_to(other.valuetype):
             return False
         if len(self.indextypes) != len(other.indextypes):
             return False
@@ -434,7 +434,7 @@ class VHDLExprPrinter(NodeTransformer):
         converter = self.conversion_functions.get((type.ultimate_base,orig_type.ultimate_base),None)
         if converter is not None:
             return converter(type,expr,orig_type)
-        if not isinstance(orig_type,VHDLArray):
+        if not isinstance(orig_type,VHDLArray) or not isinstance(type,VHDLArray):
             raise TypeError("Don't know how to convert type %s to %s"%(orig_type,type))
         # simply assume the presence of a resize function
         expr = 'resize('+expr+','+str(type.indextypes[0].length)+')'
@@ -485,7 +485,7 @@ class VHDLExprPrinter(NodeTransformer):
             return '('+lex + op + rex+')', type
         elif op in {'&'}:
             # concatenation operator (same precedence as addition operators)
-            raise NotImplementedError
+            raise NotImplementedError(type(self).__name__ + '.visit_Operator: operator '+op)
         elif op in {'+','-'} and len(node.operands)==1:
             # unary operators
             right, = node.operands
@@ -493,25 +493,32 @@ class VHDLExprPrinter(NodeTransformer):
             return '(' + op + ex+')', type
         elif op in {'*','/','mod','rem'}:
             # multiplying operators
-            raise NotImplementedError
-        elif op in {'**','abs','not'}:
+            raise NotImplementedError(type(self).__name__ + '.visit_Operator: operator '+op)
+        elif op in {'not'}:
+            right, = node.operands
+            ex,type = self.visit(right)
+            return '(' + op + ' ' + ex+')', type
+        elif op in {'**','abs'}:
             # misc operators
-            raise NotImplementedError
+            raise NotImplementedError(type(self).__name__ + '.visit_Operator: operator '+op)
         else:
-            raise TypeError('Unknown operator "%s" with %d operands'*(node.op,len(node.operands)))
+            raise TypeError('Unknown operator "%s" with %d operands'%(node.op,len(node.operands)))
 
     def visit_Slice(self, node):
         expr,type = self.visit(node.value)
         if not isinstance(type,VHDLArray):
             raise TypeError('Cannot slice value of non-array type %s'%type)
         idx, = type.indextypes
-        return expr + '(' + str(node.stop-1) + ' downto ' + str(node.start) + ')', type[node.stop-1:node.start]
+        if node.stop - node.start == 1:
+            # this is not a slice, but an indexing operation!
+            return expr + '(' + str(node.start) + ')', type.valuetype
+        return expr + '(' + str(node.stop-1) + ' downto ' + str(node.start) + ')', type.ultimate_base[node.stop-1:node.start]
 
     def visit_Cat(self, node):
-        raise NotImplementedError
+        raise NotImplementedError(type(self).__name__+'.visit_Cat')
 
     def visit_Replicate(self, node):
-        raise NotImplementedError
+        raise NotImplementedError(type(self).__name__+'.visit_Replicate')
 
     def visit_Assign(self, node):
         return self._cannot_visit(node)
@@ -532,7 +539,7 @@ class VHDLExprPrinter(NodeTransformer):
         return self._cannot_visit(node)
 
     def visit_ArrayProxy(self, node):
-        raise NotImplementedError
+        raise NotImplementedError(type(self).__name__+'.visit_ArrayProxy')
         return _ArrayProxy([self.visit(choice) for choice in node.choices],
             self.visit(node.key))
 
