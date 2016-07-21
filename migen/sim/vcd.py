@@ -130,7 +130,7 @@ def VCD_events(fh):
                 type,width,code = content[:3]
                 name = ''.join(content[3:])
                 path = '.'.join(level)
-                full_name = path + name
+                full_name = path + ('.' if path else '') + name
                 signals.setdefault(code,[]).append({
                     'type': type,
                     'name': name,
