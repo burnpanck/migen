@@ -7,11 +7,16 @@ def generate_vcd(src_files,toplevel,t=None):
     def cmd(*args):
         subprocess.check_call(['ghdl']+list(args),cwd=dir)
     with tempfile.TemporaryDirectory() as dir:
-        for f in src_files:
-            shutil.copy(f,dir)
-        cmd('-i',*tuple(os.path.split(p)[-1] for p in src_files))  # import sources
-        cmd('-m',toplevel)  # make a design
-        t = ('--stop-time='+str(t),) if t is not None else ()
-        cmd('-r',toplevel,'--vcd=out.vcd',*t)  # run the design
-        with open('out.vcd','r') as out:
-            return out.read()
+        try:
+            for f in src_files:
+                shutil.copy(f,dir)
+            cmd('-i',*tuple(os.path.split(p)[-1] for p in src_files))  # import sources
+            cmd('-m',toplevel)  # make a design
+            t = ('--stop-time='+str(t),) if t is not None else ()
+            cmd('-r',toplevel,'--vcd=out.vcd',*t)  # run the design
+            with open(os.path.join(dir,'out.vcd'),'r') as out:
+                return out.read()
+        except Exception as ex:
+            print('Files in temporary dir ',dir)
+            print('\n'.join(os.listdir(dir)))
+            raise
