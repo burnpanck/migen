@@ -401,7 +401,7 @@ standard_type_conversions = {
     (signed,integer):conv('to_signed({x},{l})'),
     (unsigned,integer):conv('to_unsigned({x},{l})'),
     (boolean,integer):conv('({x} /= 0)'),
-    (std_logic,integer):conv("to_std_ulogic({x})"),  # TODO: Only works in signal assignments
+    (std_logic,integer):conv("to_std_ulogic({x})"),
     (boolean,std_logic):conv("({x} = '1')"),
 }
 
@@ -413,19 +413,7 @@ class VHDLExprPrinter(NodeTransformer):
         tmp.update(conversion_functions)
         self.conversion_functions = tmp
 
-    def visit_as_type(self, node, type=None):
-        visited = None
-        if False:
-            if isinstance(node,Constant):
-                # constant shortcut: avoid type converted constants in output
-                cp = literal_printers.get(type.ultimate_base, None)
-                if cp is not None:
-                    l = type.indextypes[0].length if isinstance(type,VHDLArray) else None
-                    visited = cp(node.value,l)
-        if visited is None:
-            visited = self.visit(node)
-        # check for type conversions
-        expr, orig_type = visited
+    def _convert_type(self, type, expr, orig_type):
         if orig_type.compatible_with(type):
             return expr
         if orig_type.castable_to(type):
@@ -443,6 +431,11 @@ class VHDLExprPrinter(NodeTransformer):
             assert type.name is not None
             expr = type.name+'('+expr+')'
         return expr
+
+    def visit_as_type(self, node, type):
+        # check for type conversions
+        expr, orig_type = self.visit(node)
+        return self._convert_type(type,expr,orig_type)
 
     def visit_Constant(self, node):
         return str(node.value),integer.constrain(node.value,node.value)
@@ -515,7 +508,18 @@ class VHDLExprPrinter(NodeTransformer):
         return expr + '(' + str(node.stop-1) + ' downto ' + str(node.start) + ')', type.ultimate_base[node.stop-1:node.start]
 
     def visit_Cat(self, node):
-        raise NotImplementedError(type(self).__name__+'.visit_Cat')
+        pieces = []
+        nbits = 0
+        for o in node.l:
+            expr,type = self.visit(o)
+            if not isinstance(type,VHDLArray):
+                pieces.append(self._convert_type(std_logic,expr,type))
+                nbits += 1
+            else:
+                pieces.append(self._convert_type(unsigned,expr,type))
+                nbits += type.indextypes[0].length
+        expr = "unsigned'(" + '&'.join(pieces) + ')';
+        return expr, unsigned[nbits-1:0]
 
     def visit_Replicate(self, node):
         raise NotImplementedError(type(self).__name__+'.visit_Replicate')
@@ -602,14 +606,6 @@ class Converter:
 
     def _printnode(self, ns, at, level, node):
         if isinstance(node, _Assign):
-            if at == _AT_BLOCKING:
-                assignment = " := "
-            elif at == _AT_NONBLOCKING:
-                assignment = " <= "
-            elif is_variable(node.l):
-                assignment = " := "
-            else:
-                assignment = " <= "
             assignment = " <= "
             assert isinstance(node.l,Signal)
             left = self.typeof(node.l)
