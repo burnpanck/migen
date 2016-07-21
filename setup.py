@@ -9,7 +9,7 @@ if sys.version_info[:3] < (3, 3):
     raise SystemExit("You need Python 3.3+")
 
 with open(os.path.join(os.path.dirname(__file__),'migen','version.py'),'r') as fh:
-    version = re.search(r'__version__\s*=\s*("([^"]*)")|(\'([^\']*)\')')
+    version = re.search(r'__version__\s*=\s*("([^"]*)")|(\'([^\']*)\')',fh.read())
     version = version.group(2) or version.group(4)
 
 setup(
