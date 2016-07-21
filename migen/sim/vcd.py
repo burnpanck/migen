@@ -134,7 +134,7 @@ def VCD_events(fh):
                     'type': type,
                     'name': name,
                     'width': int(width),
-                    'hier': path,
+                    'hierarchy': path,
                     'full_name': full_name,
                 })
 

@@ -2,6 +2,8 @@ import tempfile
 import os, shutil
 import subprocess
 
+from .vcd import dump_VCD_events, VCD_events
+
 def generate_vcd(src_files,toplevel,t=None):
     """ Simulate model *src_file* for time t in GHDL, and return the generated VCD. """
     def cmd(*args):
@@ -15,7 +17,7 @@ def generate_vcd(src_files,toplevel,t=None):
             t = ('--stop-time='+str(t),) if t is not None else ()
             cmd('-r',toplevel,'--vcd=out.vcd',*t)  # run the design
             with open(os.path.join(dir,'out.vcd'),'r') as out:
-                return out.read()
+                return dump_VCD_events(VCD_events(out))
         except Exception as ex:
             print('Files in temporary dir ',dir)
             print('\n'.join(os.listdir(dir)))

@@ -717,9 +717,10 @@ end {name};
     def _printsync(self, f, name, ns):
         r = ""
         for k, v in sorted(f.sync.items(), key=itemgetter(0)):
-            r += name+'_'+k+": process (" + ns.get_name(f.clock_domains[k].clk) + ")\nbegin\n"
+            clk = ns.get_name(f.clock_domains[k].clk)
+            r += name+'_'+k+": process ({clk})\nbegin\nif {clk}'event and {clk} = '1' then\n".format(clk=clk)
             r += self._printnode(ns, _AT_SIGNAL, 1, v)
-            r += "end process;\n\n"
+            r += "end if;end process;\n\n"
         return r
 
     def convert(self, f, ios=None, name="top",
@@ -825,8 +826,8 @@ architecture Migen of {name} is
 procedure clk_gen(
     signal clk : out std_logic;
     constant half_period : time;
-    signal run : std_logic := '1';
-    constant first_edge : time := half_period;
+--    signal run : in std_logic;
+    constant first_edge_advance : time := 0 fs;
     constant initial_level: std_logic := '0'
 ) is
 begin
@@ -834,7 +835,7 @@ begin
   assert (half_period /= 0 fs) report "clk_gen: half_period is zero; time resolution to large for frequency" severity FAILURE;
   -- Initial phase shift
   clk <= initial_level;
-  wait for first_edge;
+  wait for half_period - first_edge_advance;
   if initial_level /= '0' then
     clk <= '0';
     wait for half_period;
@@ -842,9 +843,10 @@ begin
   -- Generate cycles
   loop
     -- Only high pulse if run is '1' or 'H'
-    if (run = '1') or (run = 'H') then
-      clk <= run;
-    end if;
+--    if (run = '1') or (run = 'H') then
+--      clk <= run;
+--    end if;
+    clk <= '1';
     wait for half_period;
     -- Low part of cycle
     clk <= '0';
@@ -874,10 +876,10 @@ begin
 
         for k in sorted(list_clock_domains(f)):
             clk = time.clocks[k]
-            src += """clk_gen({name}_clk, {dt} ns, '1', {first_dt} ns, {initial}); """.format(
+            src += """clk_gen({name}_clk, {dt} ns, {advance} ns, {initial}); """.format(
                 name=k,
                 dt=clk.half_period,
-                first_dt=clk.time_before_trans,
+                advance=clk.half_period - clk.time_before_trans,
                 initial="'1'" if clk.high else "'0'",
             )
 
