@@ -9,6 +9,7 @@ from migen.fhdl.tools import *
 from migen.fhdl.visit import NodeTransformer
 from migen.fhdl.namer import build_namespace
 from migen.fhdl.conv_output import ConvOutput
+from migen.fhdl.bitcontainer import value_bits_sign
 
 _reserved_keywords = {
     "abs", "access", "after", "alias", "all", "and", "architecture", "array", "assert",
@@ -365,8 +366,7 @@ class VHDLExprPrinter(NodeTransformer):
     def _convert_type(self, type, expr, orig_type):
         if orig_type.compatible_with(type):
             return expr
-        if orig_type.castable_to(type):
-            assert type.name is not None   # or?
+        if orig_type.castable_to(type) and type.name is not None:
             return type.name + '(' + expr + ')'
         converter = self.conversion_functions.get((type.ultimate_base,orig_type.ultimate_base),None)
         if converter is not None:
@@ -400,6 +400,7 @@ class VHDLExprPrinter(NodeTransformer):
         return self.visit_Signal(node)
 
     def visit_Operator(self, node):
+        verilog_bits, verilog_signed = value_bits_sign(node)
         op = Verilog2VHDL_operator_map[node.op]  # TODO: op=='m'
         if op in {'and','or','nand','nor','xor','xnor'}:
             # logical operators
@@ -422,8 +423,15 @@ class VHDLExprPrinter(NodeTransformer):
         elif op in {'+','-'} and len(node.operands)==2:
             # addition operators
             left,right = node.operands
-            lex,type = self.visit(left)
-            rex = self.visit_as_type(right,type)
+            if False:
+                # VHDL semantics
+                lex,type = self.visit(left)
+                rex = self.visit_as_type(right,type)
+            else:
+                # emulate Verilog semantics in VHDL
+                type = (signed if verilog_signed else unsigned)[verilog_bits-1:0]
+                lex = self.visit_as_type(left,type)
+                rex = self.visit_as_type(right,type)
             return '('+lex + op + rex+')', type
         elif op in {'&'}:
             # concatenation operator (same precedence as addition operators)
@@ -470,7 +478,7 @@ class VHDLExprPrinter(NodeTransformer):
                 pieces.append(self._convert_type(unsigned[l-1:0],expr,type))
 #                pieces.append(expr)
                 nbits += l
-        expr = "unsigned'(" + '&'.join(pieces) + ')';
+        expr = "unsigned'(" + '&'.join(reversed(pieces)) + ')';
         return expr, unsigned[nbits-1:0]
 
     def visit_Replicate(self, node):

@@ -28,18 +28,20 @@ class DivisionCase(SimCase, unittest.TestCase):
         self.run_with(gen())
 
     class TestBenchWithStimulus(Module):
+        w = 4
         def __init__(self):
-            self.submodules.dut = dut = Divider(4)
-            self.dividend = dividend = Signal(4)
-            self.divisor = divisor = Signal(4,reset=1)
+            w = self.w
+            self.submodules.dut = dut = Divider(w)
+            dividend = dut.dividend_i
+            divisor = dut.divisor_i
             self.sync += If(
-                dut.ready_o,
+                dut.ready_o & ~dut.start_i,
                 dut.start_i.eq(1),
             ).Elif(
                 dut.start_i,
                 dut.start_i.eq(0),
                 If(
-                    divisor == 15,
+                    divisor == (1<<w)-1,
                     divisor.eq(1),
                     dividend.eq(dividend + 1),
                 ).Else(
@@ -48,4 +50,6 @@ class DivisionCase(SimCase, unittest.TestCase):
             )
 
     def test_conversion(self):
-        self.convert_run_and_compare(self.TestBenchWithStimulus,cycles=15*16*5)
+        tb = self.TestBenchWithStimulus
+        n = 1<<tb.w
+        self.convert_run_and_compare(tb,cycles=((n-1)*n+1)*(n+1))  # n-1 divisors, n dividends, n+1 cyles each. Additionally, the testbench starts with trying 0/0
