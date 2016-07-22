@@ -67,22 +67,35 @@ class SimCase:
             for k in set(vhdlvcd) & set(vcdref):
                 v = vhdlvcd[k]
                 vr = vcdref[k]
-                n = min(v.size, vr.size)
+                # skip events at start of simulation, the simulators do not seem to agree on where signals start
+                starttime = max(np.r_[v.time[v.time>0][:1]//1000000,vr.time[vr.time>0][:1]])
+                i = np.searchsorted(v.time,starttime*1000000)
+                ir = np.searchsorted(vr.time,starttime)
+                n = min(v.size-i, vr.size-ir)
                 mismatch[k] = (np.flatnonzero(
-                    (v.time[:n] // 1000000 != vr.time[:n])   # GHDL uses fs as default timescale
-                    | (v.value[:n] != vr.value[:n])
+                    (v.time[i:][:n] // 1000000 != vr.time[ir:][:n])   # GHDL uses fs as default timescale
+                    | (v.value[i:][:n] != vr.value[ir:][:n])
                 ),n)
             print('Matchin signals:')
             print('VHDL:      ',sorted(vhdlvcd))
             print('reference: ',sorted(vcdref))
             for k in sorted(set(vhdlvcd) & set(vcdref)):
-                v = [hex(v).split('x',1)[1] for v in vhdlvcd[k].value[:80]]
-                vr = [hex(v).split('x',1)[1] for v in vcdref[k].value[:80]]
+                v = vhdlvcd[k]
+                vr = vcdref[k]
+                # skip events at start of simulation, the simulators do not seem to agree on where signals start
+                starttime = max(np.r_[v.time[v.time>0][:1]//1000000,vr.time[vr.time>0][:1]])
+                i = np.searchsorted(v.time,starttime*1000000)
+                ir = np.searchsorted(vr.time,starttime)
+                v = [hex(s).split('x',1)[1] for s in v.value[i:][:80]]
+                vr = [hex(s).split('x',1)[1] for s in vr.value[ir:][:80]]
                 w = max(len(s) for s in v + vr)
                 n = 160 // (w + 1)
                 print('Signal "%s" fails on %d out of %d events' % (k, mismatch[k][0].size, mismatch[k][1]))
                 print('|'.join(s.rjust(w) for s in v[:n]))
                 print('|'.join(s.rjust(w) for s in vr[:n]))
+                if mismatch[k][0].size:
+                    print(i,v.time[:i+2],v.value[:i+2])
+                    print(ir,vr.time[:ir+2],vr.value[:ir+2])
             if any(m.size for m,n in mismatch.values()):
                 failed_signals = '\n'.join(
                     '"%s" on %d out of %d events'%(k,m.size,n)

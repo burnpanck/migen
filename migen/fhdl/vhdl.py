@@ -407,7 +407,7 @@ class VHDLExprPrinter(NodeTransformer):
             left,right = node.operands
             lex,type = self.visit(left)
             rex = self.visit_as_type(right,type)
-            return '('+lex + op + rex+')', type
+            return '('+lex + ' ' + op + ' ' + rex+')', type
         elif op in {'<','<=','=','/=','>','>='}:
             # relational operators
             left,right = node.operands
