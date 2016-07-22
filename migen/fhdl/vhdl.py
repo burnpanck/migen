@@ -327,64 +327,6 @@ class Architecture:
 
 (_AT_BLOCKING, _AT_NONBLOCKING, _AT_SIGNAL) = range(3)
 
-
-def _list_comb_wires(f):
-    r = set()
-    groups = group_by_targets(f.comb)
-    for g in groups:
-        if len(g[1]) == 1 and isinstance(g[1][0], _Assign):
-            r |= g[0]
-    return r
-
-def _printcomb_verilog(f, ns,
-                       display_run,
-                       dummy_signal,
-                       blocking_assign):
-    r = ""
-    if f.comb:
-        if dummy_signal:
-            # Generate a dummy event to get the simulator
-            # to run the combinatorial process once at the beginning.
-            syn_off = "// synthesis translate_off\n"
-            syn_on = "// synthesis translate_on\n"
-            dummy_s = Signal(name_override="dummy_s")
-            r += syn_off
-            r += "reg " + _printsig_verilog(ns, dummy_s) + ";\n"
-            r += "initial " + ns.get_name(dummy_s) + " <= 1'd0;\n"
-            r += syn_on
-
-        groups = group_by_targets(f.comb)
-
-        for n, g in enumerate(groups):
-            if len(g[1]) == 1 and isinstance(g[1][0], _Assign):
-                r += "assign " + _printnode_verilog(ns, _AT_BLOCKING, 0, g[1][0])
-            else:
-                if dummy_signal:
-                    dummy_d = Signal(name_override="dummy_d")
-                    r += "\n" + syn_off
-                    r += "reg " + _printsig_verilog(ns, dummy_d) + ";\n"
-                    r += syn_on
-
-                r += "always @(*) begin\n"
-                if display_run:
-                    r += "\t$display(\"Running comb block #" + str(n) + "\");\n"
-                if blocking_assign:
-                    for t in g[0]:
-                        r += "\t" + ns.get_name(t) + " = " + _printexpr_verilog(ns, t.reset)[0] + ";\n"
-                    r += _printnode_verilog(ns, _AT_BLOCKING, 1, g[1])
-                else:
-                    for t in g[0]:
-                        r += "\t" + ns.get_name(t) + " <= " + _printexpr_verilog(ns, t.reset)[0] + ";\n"
-                    r += _printnode_verilog(ns, _AT_NONBLOCKING, 1, g[1])
-                if dummy_signal:
-                    r += syn_off
-                    r += "\t" + ns.get_name(dummy_d) + " <= " + ns.get_name(dummy_s) + ";\n"
-                    r += syn_on
-                r += "end\n"
-    r += "\n"
-    return r
-
-
 Verilog2VHDL_operator_map = {v[0]:v[-1] for v in (v.split(':') for v in '''
  &:and |:or ^:xor
  < <= ==:= !=:/= > >=
@@ -408,6 +350,7 @@ standard_type_conversions = {
     (unsigned,integer):conv('to_unsigned({x},{l})'),
     (boolean,integer):conv('({x} /= 0)'),
     (std_logic,integer):conv("to_std_ulogic({x})"),
+    (std_logic,boolean):conv("to_std_ulogic({x})"),
     (boolean,std_logic):conv("({x} = '1')"),
 }
 
@@ -698,7 +641,6 @@ use work.migen_helpers.all;
         special_outs = list_special_ios(f, False, True, True)
         inouts = list_special_ios(f, False, False, True)
         targets = list_targets(f) | special_outs
-        wires = _list_comb_wires(f) | special_outs
         r = """
 entity {name} is
 \tport(
@@ -718,7 +660,6 @@ end {name};
         special_outs = list_special_ios(f, False, True, True)
         inouts = list_special_ios(f, False, False, True)
         targets = list_targets(f) | special_outs
-        wires = _list_comb_wires(f) | special_outs
         r = """
     architecture Migen of {name} is
     """.format(name=name)
@@ -738,10 +679,35 @@ end {name};
             r += "end if;end process;\n\n"
         return r
 
+    def _printcomb(self, f, ns):
+        r = ""
+        if f.comb:
+            groups = group_by_targets(f.comb)
+
+            for n, g in enumerate(groups):
+                if len(g[1]) == 1 and isinstance(g[1][0], _Assign):
+                    r += self._printnode(ns, _AT_BLOCKING, 0, g[1][0])
+                else:
+                    for t in g[0]:
+                        r += "\t" + ns.get_name(t) + " <= " + self._printexpr(ns, t.reset) + ";\n"
+                    r += self._printnode(ns, _AT_NONBLOCKING, 1, g[1])
+        r += "\n"
+        return r
+
+    def _printspecials(self, overrides, specials, ns, add_data_file):
+        r = ""
+        for special in sorted(specials, key=lambda x: x.duid):
+            pr = call_special_classmethod(overrides, special, "emit_verilog", ns, add_data_file)
+            if pr is None:
+                raise NotImplementedError("Special " + str(special) + " failed to implement emit_verilog")
+            r += pr
+        return r
+
     def convert(self, f, ios=None, name="top",
-      special_overrides=dict(),
-      create_clock_domains=True,
-      display_run=False, asic_syntax=False):
+        special_overrides=dict(),
+        create_clock_domains=True,
+        asic_syntax=False
+    ):
         r = ConvOutput()
         if not isinstance(f, _Fragment):
             f = f.get_fragment()
@@ -786,18 +752,10 @@ end {name};
         src += self._printuse()
         src += self._printentitydecl(f, ios, name, ns, reg_initialization=not asic_syntax)
         src += self._printarchitectureheader(f, ios, name, ns, reg_initialization=not asic_syntax)
+        src += self._printcomb(f, ns)
         src += self._printsync(f, name, ns)
+        src += self._printspecials(special_overrides, f.specials - lowered_specials, ns, r.add_data_file)
         src += "end Migen;\n"
-        if False:
-            src += _printheader_verilog(f, ios, name, ns,
-                                        reg_initialization=not asic_syntax)
-            src += _printcomb_verilog(f, ns,
-                                      display_run=display_run,
-                                      dummy_signal=not asic_syntax,
-                                      blocking_assign=asic_syntax)
-            src += _printsync_verilog(f, ns)
-            src += _printspecials_verilog(special_overrides, f.specials - lowered_specials, ns, r.add_data_file)
-            src += "endmodule\n"
         r.set_main_source(src)
 
         return r
@@ -822,7 +780,6 @@ end {name};
         special_outs = list_special_ios(f, False, True, True)
         inouts = list_special_ios(f, False, False, True)
         targets = list_targets(f) | special_outs
-        wires = _list_comb_wires(f) | special_outs
 
         time = TimeManager(clocks)
 
@@ -902,5 +859,5 @@ begin
 
         return src
 
-def convert(f, ios=None, name="top", special_overrides={}, create_clock_domains=True, display_run=False, asic_syntax=False):
-    return Converter().convert(f,ios,name,special_overrides,create_clock_domains,display_run,asic_syntax)
+def convert(f, ios=None, name="top", special_overrides={}, create_clock_domains=True, asic_syntax=False):
+    return Converter().convert(f,ios,name,special_overrides,create_clock_domains,asic_syntax)
