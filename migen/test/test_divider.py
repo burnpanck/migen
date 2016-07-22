@@ -30,8 +30,8 @@ class DivisionCase(SimCase, unittest.TestCase):
     class TestBenchWithStimulus(Module):
         def __init__(self):
             self.submodules.dut = dut = Divider(4)
-            self.divident = dividend = Signal(4)
-            self.divisor = divisor = Signal(1,reset=1)
+            self.dividend = dividend = Signal(4)
+            self.divisor = divisor = Signal(4,reset=1)
             self.sync += If(
                 dut.ready_o,
                 dut.start_i.eq(1),

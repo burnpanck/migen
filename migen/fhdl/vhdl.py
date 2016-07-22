@@ -52,6 +52,7 @@ class VHDLType(abc.ABC):
         pass
 
     def compatible_with(self,other):
+        """ Can be assigned without a cast. """
         return self.ultimate_base == other.ultimate_base
 
     unconstrained = False
@@ -206,6 +207,11 @@ class VHDLArray(VHDLComposite):
         if len(self.indextypes) != len(other.indextypes):
             return False
         return all(s.castable_to(o) for s,o in zip(self.indextypes, other.indextypes))
+
+    def compatible_with(self,other):
+        if not isinstance(other,VHDLArray) or not self.ultimate_base == other.ultimate_base:
+            return False
+        return self.unconstrained or other.unconstrained or tuple(i.length for i in self.indextypes) == tuple(i.length for i in other.indextypes)
 
     unconstrained = True
 
@@ -514,10 +520,13 @@ class VHDLExprPrinter(NodeTransformer):
             expr,type = self.visit(o)
             if not isinstance(type,VHDLArray):
                 pieces.append(self._convert_type(std_logic,expr,type))
+ #               pieces.append(expr)
                 nbits += 1
             else:
-                pieces.append(self._convert_type(unsigned,expr,type))
-                nbits += type.indextypes[0].length
+                l = type.indextypes[0].length
+                pieces.append(self._convert_type(unsigned[l-1:0],expr,type))
+#                pieces.append(expr)
+                nbits += l
         expr = "unsigned'(" + '&'.join(pieces) + ')';
         return expr, unsigned[nbits-1:0]
 
@@ -609,6 +618,9 @@ class Converter:
             assignment = " <= "
             assert isinstance(node.l,Signal)
             left = self.typeof(node.l)
+#            lt = VHDLExprPrinter(ns,_MapProxy(self.typeof)).visit(node.l)[1]
+#            rt = VHDLExprPrinter(ns,_MapProxy(self.typeof)).visit(node.r)[1]
+#            print('Assign to ',ns.get_name(node.l),left,lt,rt)
             return "\t" * level + self._printexpr(ns, node.l) + assignment + self._printexpr(ns, node.r, type=left) + ";\n"
         elif isinstance(node, collections.Iterable):
             return "".join(list(map(partial(self._printnode, ns, at, level), node)))

@@ -49,7 +49,7 @@ if __name__ == "__main__":
         print('Unable to find GHDL, cannot run VHDL simulation: ',ex)
     else:
         print('GHDL version: ',ghdl_version)
-        vcd = generate_vcd([__file__+'.vhd'],'top_testbench',t='210ns')
+        vcd = generate_vcd([__file__+'.vhd'],'top_testbench', stoptime='210ns')
     with open('basic1.vcd','r') as fh:
         vcdref = dump_VCD_events(VCD_events(fh))
     print('*** Comparing VCD output of the two simulation runs')
