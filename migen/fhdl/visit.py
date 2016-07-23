@@ -1,9 +1,10 @@
 from copy import copy
 from operator import itemgetter
+from contextlib import contextmanager
 
 from migen.fhdl.structure import *
 from migen.fhdl.structure import (_Operator, _Slice, _Assign, _ArrayProxy,
-                                  _Fragment)
+                                  _Fragment, _Value, _Statement)
 
 
 class NodeVisitor:
@@ -103,12 +104,15 @@ class NodeVisitor:
         pass
 
 
-# Default methods always copy the node, except for:
-# - Signals, ClockSignals and ResetSignals
-# - Unknown objects
-# - All fragment fields except comb and sync
-# In those cases, the original node is returned unchanged.
 class NodeTransformer:
+    """ Base class for node transformers
+
+    Default methods always copy the node, except for:
+    - Signals, ClockSignals and ResetSignals
+    - Unknown objects
+    - All fragment fields except comb and sync
+    In those cases, the original node is returned unchanged.
+    """
     def visit(self, node):
         if isinstance(node, Constant):
             return self.visit_Constant(node)

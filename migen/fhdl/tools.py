@@ -42,6 +42,18 @@ class _InputLister(NodeVisitor):
     def visit_Assign(self, node):
         self.visit(node.r)
 
+class _TreeFormatter(NodeVisitor):
+    def __init__(self,indent='  ',prefix=''):
+        self.level = 0
+        self.indent = indent
+        self.prefix = prefix
+        self.output = []
+
+    def visit(self, node):
+        self.output.append(self.prefix + self.indent*self.level + type(node).__name__)
+        self.level += 1
+        super().visit(node)
+        self.level -= 1
 
 def list_signals(node):
     lister = _SignalLister()
@@ -60,6 +72,10 @@ def list_inputs(node):
     lister.visit(node)
     return lister.output_list
 
+def format_tree(node,indent='  ',prefix=''):
+    visitor = _TreeFormatter(indent,prefix)
+    visitor.visit(node)
+    return '\n'.join(visitor.output)
 
 def _resort_statements(ol):
     return [statement for i, statement in

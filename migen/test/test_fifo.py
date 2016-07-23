@@ -54,3 +54,22 @@ class SyncFIFOCase(SimCase, unittest.TestCase):
                     self.assertEqual((yield self.tb.dut.dout[32:]), i*2)
                 yield
         self.run_with(gen())
+
+    class TestBenchWithStimulus(TestBench):
+        def __init__(self):
+            super(SyncFIFOCase.TestBenchWithStimulus,self).__init__()
+            dut = self.dut
+
+            c2 = Signal(max=2)
+            c5 = Signal(max=5)
+            c7 = Signal(max=7)
+            self.sync += If(c2,c2.eq(c2-1)).Else(c2.eq(2-1))
+            self.sync += If(c5,c5.eq(c5-1)).Else(c5.eq(5-1))
+            self.sync += If(c7,c7.eq(c7-1)).Else(c7.eq(7-1))
+            self.sync += dut.we.eq(c2 == 0)
+            self.sync += dut.re.eq(c7 == 0)
+            self.sync += dut.replace.eq(c5 == 1)
+
+    def test_conversion(self):
+        tb = self.TestBenchWithStimulus
+        self.convert_run_and_compare(tb,cycles=2*7*5 * 2)
