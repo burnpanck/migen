@@ -272,36 +272,37 @@ class Memory(Special):
     def emit_vhdl(memory, converter, ns, add_data_file):
         def pex(e, type=None):
             return converter._printexpr(ns, e, type)
-        use = []
-
-        decl = ""
-        decl += "signal "+ns.get_name(memory)+": array(0 to "+str(memory.depth-1)+') of std_logic_vector;\n'
-
-        body = ""
         name = ns.get_name(memory)
         adrbits = bits_for(memory.depth-1)
 
+        use = []
+
+        decl = """type {name}_type is array(0 to {depth}) of std_logic_vector({width} downto 0);
+signal {name}: {name}_type;""".format(name=name,depth=memory.depth-1,width=memory.width-1)
+        addrtype = vhdl.integer.constrain(0,memory.depth-1)
+        memtype = vhdl.std_logic_vector[memory.width-1:0]
+
+        body = ""
         adr_regs = {}
         data_regs = {}
         for port in memory.ports:
             if not port.async_read:
                 if port.mode == WRITE_FIRST and port.we is not None:
                     adr_reg = Signal(adrbits,name_override="memadr")
-                    decl += "signal "+ns.get_name(adr_reg)+ ": unsigned(" + str(adrbits-1) + " downto 0);\n"
+                    decl += "signal "+converter._printsig(ns,adr_reg,'')+";\n"
                     adr_regs[id(port)] = adr_reg
                 else:
                     data_reg = Signal(memory.width,name_override="memdat")
-                    decl += "signal "+ns.get_name(data_reg)+ ": unsigned(" + str(memory.width-1) + " downto 0);\n"
+                    decl += "signal "+converter._printsig(ns,data_reg,'')+";\n"
                     data_regs[id(port)] = data_reg
 
         for k,port in enumerate(memory.ports):
-#            adr = pex(port.adr,vhdl.integer.constrain(0,memory.depth-1))
-            adr = pex(port.adr,vhdl.unsigned[adrbits-1:0])
+            adr = pex(port.adr,addrtype)
             if port.we is not None or not port.async_read:
                 clk = pex(port.clock)
                 body += "ram_{name}_port_{pidx}: process({clk}) is\nbegin\nif rising_edge({clk}) then\n".format(name=name,pidx=k,clk=clk)
                 if port.we is not None:
-                    dat_w = pex(port.dat_w,vhdl.unsigned[memory.width-1:0])
+                    dat_w = pex(port.dat_w,vhdl.std_logic_vector[memory.width-1:0])
                     if port.we_granularity:
                         n = memory.width//port.we_granularity
                         for i in range(n):
@@ -309,37 +310,52 @@ class Memory(Special):
                             M = (i+1)*port.we_granularity-1
                             sl = "(" + str(M) + " downto " + str(m) + ")"
                             body += "\tif " + pex(port.we,vhdl.std_logic_vector[n-1:0]) + "(" + str(i) + ") = '1' then \n"
-                            body += "\t\t" + name + "(" + adr + ")" + sl + " <= " + dat_w + sl + ";\nend if;\n"
+                            body += "\t\t" + name + "(" + adr + ")" + sl + " <= " + dat_w + sl + ";\n\tend if;\n"
                     else:
-                        body += "\tif " + pex(port.we,vhdl.boolean) + " then\n"
-                        body += "\t\t" + name + "(" + adr + ") <= " + dat_w + ";\nend if\n"
+                        body += "\tif " + pex(port.we,vhdl.integer) + "/=0 then\n"
+                        body += "\t\t" + name + "(" + adr + ") <= " + dat_w + ";\n\tend if;\n"
                 if not port.async_read:
                     if port.mode == WRITE_FIRST and port.we is not None:
-                        rd = "\t" + pex(adr_regs[id(port)]) + " <= " + adr + ";\n"
+                        adr_r,regtype = pex(adr_regs[id(port)],type=True)
+                        rd = "\t" + adr_r + " <= " + pex(port.adr,regtype) + ";\n"
                     else:
-                        bassign = pex(data_regs[id(port)]) + " <= " + name + "(" + adr + ");\n"   # TODO: ensure types match
+                        dat_r,regtype = pex(data_regs[id(port)],type=True)
+                        bassign = (
+                            dat_r + " <= "
+                            + converter._convert_expr_type(regtype, name + "(" + adr + ")", memtype)
+                            + ";\n"
+                        )
                         if port.mode == READ_FIRST or port.we is None:
                             rd = "\t" + bassign
                         elif port.mode == NO_CHANGE:
-                            rd = "\tif not " + pex(port.we,vhdl.boolean) + " then\n" \
+                            rd = "\tif " + pex(port.we,vhdl.integer) + "=0 then\n" \
                               + "\t\t" + bassign + 'end if;\n'
                     if port.re is None:
                         body += rd
                     else:
-                        body += "\tif " + pex(port.re, vhdl.boolean) + " then \n"
+                        body += "\tif " + pex(port.re, vhdl.integer) + "/=0 then \n"
                         body += "\t" + rd.replace("\n\t", "\n\t\t") + "\tend if;\n"
                 body += "end if;\nend process;\n"
             else:
                 body += "-- ram {name} port {pidx}\n".format(name=name,pidx=k)
 
-            dat_r = pex(port.dat_r)
+            dat_r,regtype = pex(port.dat_r,type=True)
             if port.async_read:
-                body += dat_r + " <= " + name + "(" + adr + ");\n"
+                body += (
+                    dat_r + " <= "
+                    + converter._convert_expr_type(regtype, name + "(" + adr + ")", memtype)
+                    + ";\n"
+                )
             else:
                 if port.mode == WRITE_FIRST and port.we is not None:
-                    body += dat_r + " <= " + name + "(" + pex(adr_regs[id(port)],vhdl.integer) + ");\n"
+                    adr_r = pex(adr_regs[id(port)],type=addrtype)
+                    body += (
+                        dat_r + " <= "
+                        + converter._convert_expr_type(regtype, name + "(" + adr_r + ")", memtype)
+                        + ";\n"
+                    )
                 else:
-                    body += dat_r + " <= " + pex(data_regs[id(port)],converter.typeof(port.dat_r)) + ";\n"
+                    body += dat_r + " <= " + pex(data_regs[id(port)],regtype) + ";\n"
             body += "\n"
 
         if memory.init is not None:

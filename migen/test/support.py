@@ -3,17 +3,17 @@ import tempfile, os, subprocess, re, shutil
 from migen import *
 from migen.fhdl import verilog, vhdl
 
-
 class SimCase:
     def setUp(self, *args, **kwargs):
         self.tb = self.TestBench(*args, **kwargs)
 
     def test_to_verilog(self):
         out = verilog.convert(self.tb)
-        print(out)
+        # print(out)
 
     def test_to_vhdl(self):
-        vhdl.convert(self.tb)
+        out = vhdl.convert(self.tb)
+        # print(out)
 
     def run_with(self, generator):
         run_simulation(self.tb, generator)
@@ -23,6 +23,7 @@ class SimCase:
         Then, compare the generated VCD files. Any mismatch is considered a failure.
         """
         import numpy as np
+        from io import StringIO
 
         from migen.sim.vcd import dump_VCD_events, VCD_events
         from migen.sim.ghdl import generate_vcd
@@ -51,29 +52,32 @@ class SimCase:
                 ghdl_version = subprocess.check_output(['ghdl', '--version'])
             except FileNotFoundError as ex:
                 self.skipTest("GHDL seems to be unavailable")
-            else:
-                vhdlvcd = generate_vcd(
-                    [vhdlfile], 'top_testbench',
-                    stoptime=str(cycles * 10) + 'ns',
-                    keep_files_on_fail=keep_files_on_fail,
-                )
+            migen_vhd = os.path.abspath(os.path.join(os.path.dirname(vhdl.__file__),'migen.vhd'))
+            rawvhdlvcd = generate_vcd(
+                [vhdlfile,migen_vhd], 'top_testbench',
+                stoptime=str(cycles * 10) + 'ns',
+                keep_files_on_fail=keep_files_on_fail,
+            )
+            vhdlvcd = dump_VCD_events(VCD_events(StringIO(rawvhdlvcd)))
 
             # compare VHDL output with reference
             vhdlvcd = {
                 re.match(r'dut\.(.*?)(\[\d+:\d+])?$', k).group(1): v for k, v in vhdlvcd.items()
                 if k.startswith('dut.')
             }
+            for v in vhdlvcd.values():
+                v._time //= 1000000
             mismatch = {}
             for k in set(vhdlvcd) & set(vcdref):
                 v = vhdlvcd[k]
                 vr = vcdref[k]
                 # skip events at start of simulation, the simulators do not seem to agree on where signals start
-                starttime = max(np.r_[v.time[v.time>0][:1]//1000000,vr.time[vr.time>0][:1]])
-                i = np.searchsorted(v.time,starttime*1000000)
+                starttime = max(np.r_[v.time[v.time>0][:1],vr.time[vr.time>0][:1]])
+                i = np.searchsorted(v.time,starttime)
                 ir = np.searchsorted(vr.time,starttime)
                 n = min(v.size-i, vr.size-ir)
                 mismatch[k] = (np.flatnonzero(
-                    (v.time[i:][:n] // 1000000 != vr.time[ir:][:n])   # GHDL uses fs as default timescale
+                    (v.time[i:][:n] != vr.time[ir:][:n])   # GHDL uses fs as default timescale
                     | (v.value[i:][:n] != vr.value[ir:][:n])
                 ),n)
             print('Matchin signals:')
@@ -83,16 +87,16 @@ class SimCase:
                 v = vhdlvcd[k]
                 vr = vcdref[k]
                 # skip events at start of simulation, the simulators do not seem to agree on where signals start
-                starttime = max(np.r_[v.time[v.time>0][:1]//1000000,vr.time[vr.time>0][:1]])
-                i = np.searchsorted(v.time,starttime*1000000)
+                starttime = max(np.r_[v.time[v.time>0][:1],vr.time[vr.time>0][:1]])
+                i = np.searchsorted(v.time,starttime)
                 ir = np.searchsorted(vr.time,starttime)
-                v = [hex(s).split('x',1)[1] for s in v.value[i:][:80]]
-                vr = [hex(s).split('x',1)[1] for s in vr.value[ir:][:80]]
-                w = max(len(s) for s in v + vr)
+                sv = [hex(s).split('x',1)[1] for s in v.value[i:][:80]]
+                svr = [hex(s).split('x',1)[1] for s in vr.value[ir:][:80]]
+                w = max(len(s) for s in sv + svr)
                 n = 160 // (w + 1)
                 print('Signal "%s" fails on %d out of %d events' % (k, mismatch[k][0].size, mismatch[k][1]))
-                print('|'.join(s.rjust(w) for s in v[:n]))
-                print('|'.join(s.rjust(w) for s in vr[:n]))
+                print('|'.join(s.rjust(w) for s in sv[:n]))
+                print('|'.join(s.rjust(w) for s in svr[:n]))
                 if mismatch[k][0].size:
                     print(i,v.time[:i+2],v.value[:i+2])
                     print(ir,vr.time[:ir+2],vr.value[:ir+2])
@@ -105,6 +109,12 @@ class SimCase:
                 try:
                     shutil.copytree(dir, keep_files_on_fail)
                 except FileExistsError:
+                    pass
+                try:
+                    with open(os.path.join(keep_files_on_fail,'vhdl.vcd'),'x') as fh:
+                        fh.write(rawvhdlvcd)
+                except Exception as ex:
+                    print('Failed to store VHDL VCD output:',ex)
                     pass
                 raise AssertionError(
                     'GHDL simulation of VHDL output does not match reference simulation in Migen on the following signals:\n'

@@ -29,13 +29,13 @@ def generate_vcd(src_files, toplevel, stoptime=None, keep_files_on_fail=None):
                     for p in src_files:
                         fn = os.path.split(p)[-1]
                         output = re.sub(
-                            '^('+re.escape(fn)+r'):(\d+)',
+                            '('+re.escape(fn)+r'):(\d+)',
                             os.path.abspath(os.path.join(keep_files_on_fail,fn)).replace('\\','\\\\')+r':\2',
                             output, flags = re.MULTILINE,
                         )
                 raise RuntimeError('GHDL failed with the following output:\n'+output)
             with open(os.path.join(dir,'out.vcd'),'r') as out:
-                return dump_VCD_events(VCD_events(out))
+                return out.read()
         except Exception as ex:
             try:
                 shutil.copytree(dir,keep_files_on_fail)

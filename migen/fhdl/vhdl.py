@@ -7,7 +7,8 @@ import abc
 from migen.fhdl.structure import *
 from migen.fhdl.structure import _Operator, _Slice, _Assign, _Fragment, _Value, _Statement
 from migen.fhdl.tools import *
-from migen.fhdl.visit import NodeTransformer, ContextualTransformer, visitor_for
+from migen.fhdl.visit import NodeTransformer
+from migen.fhdl.visit_generic import NodeTransformer as ContextualTransformer, visitor_for
 from migen.fhdl.namer import build_namespace
 from migen.fhdl.conv_output import ConvOutput
 from migen.fhdl.bitcontainer import value_bits_sign
@@ -254,11 +255,15 @@ class VHDLArray(VHDLComposite):
         )
 
     def castable_to(self, other):
+#        print(self,' castable_to ',other,'?')
         if not isinstance(other, VHDLArray) or not self.valuetype.castable_to(other.valuetype):
+#            print(self.valuetype,' not castable_to ',isinstance(other,VHDLArray) and other.valuetype,'!')
             return False
         if len(self.indextypes) != len(other.indextypes):
+#            print(self.indextypes,' not the same dimensionality as ',other.indextypes,'!')
             return False
-        return all(s.castable_to(o) for s,o in zip(self.indextypes, other.indextypes))
+#        print('|'.join(str(s.castable_to(o)) for s,o in zip(self.indextypes, other.indextypes)))
+        return all(s.castable_to(o) and s.length == o.length for s,o in zip(self.indextypes, other.indextypes))
 
     def compatible_with(self,other):
         if not isinstance(other,VHDLArray) or not self.ultimate_base == other.ultimate_base:
@@ -444,15 +449,6 @@ class ToVHDLConverter(ContextualTransformer):
     def visit_Constant(self, node, ctxt):
         return self.type_wrap(node,ctxt,(Signed if node.signed else Unsigned)(node.nbits))
 
-    def visit_Signal(self, node):
-        name = self.ns.get_name(node)
-        return name, self.signal_types[node]
-
-    def visit_ClockSignal(self, node):
-        return self.visit_Signal(node)
-
-    def visit_ResetSignal(self, node):
-        return self.visit_Signal(node)
 
     @visitor_for(_Operator)
     def visit_Operator(self, node, ctxt):
@@ -579,54 +575,15 @@ Verilog2VHDL_operator_map = {v[0]:v[-1] for v in (v.split(':') for v in '''
  ~:not
 '''.split())}
 
-def conv(format):
-    def convert(type,expr,orig=None):
-        return format.format(
-            x=expr,
-            l=type.indextypes[0].length if isinstance(type,VHDLArray) else None,
-        )
-    return convert
-standard_type_conversions = {
-    (integer,std_logic):conv('to_integer(to_unsigned({x},1))'),   # '1', 'H' -> 1, else 0
-    (integer,signed):conv('to_integer({x})'),   # one-to-one
-    (integer,unsigned):conv('to_integer({x})'), # one-to-one
-    (signed,integer):conv('to_signed({x},{l})'), # ?
-    (unsigned,std_logic):conv('to_unsigned({x},{l})'),   # '1','H' -> 1, else -> 0
-    (unsigned,integer):conv('to_unsigned({x},{l})'),   # ?
-    (std_logic,boolean):conv("to_std_ulogic({x})"), # true -> '1', false -> '0'
-    (std_logic,integer):conv("to_std_ulogic({x})"), # true -> 1, false -> 0
-    (std_logic,unsigned):conv("to_std_ulogic(to_integer({x}) /= 0)"), # 0 -> '0', else -> '1'
-    (boolean,std_logic):conv("({x} = '1')"),
-    (boolean,integer):conv('({x} /= 0)'),
-    (boolean,unsigned):conv("(to_integer({x}) /= 0)"), # 0 -> '0', else -> '1'
-}
-
 
 class VHDLExprPrinter(NodeTransformer):
-    def __init__(self,ns,signal_types,conversion_functions = {}):
+    def __init__(self,ns,signal_types,conversion_function):
         self.ns = ns
         self.signal_types = signal_types
-        tmp = dict(standard_type_conversions)
-        tmp.update(conversion_functions)
-        self.conversion_functions = tmp
+        self.conversion_function = conversion_function
 
     def _convert_type(self, type, expr, orig_type):
-        if orig_type.compatible_with(type):
-            return expr
-        if orig_type.castable_to(type) and type.name is not None:
-            return type.name + '(' + expr + ')'
-        converter = self.conversion_functions.get((type.ultimate_base,orig_type.ultimate_base),None)
-        if converter is not None:
-            return converter(type,expr,orig_type)
-        if not isinstance(orig_type,VHDLArray) or not isinstance(type,VHDLArray):
-            raise TypeError("Don't know how to convert type %s to %s"%(orig_type,type))
-        # simply assume the presence of a resize function
-        expr = 'resize('+expr+','+str(type.indextypes[0].length)+')'
-        if not orig_type.valuetype.compatible_with(type.valuetype):
-            assert orig_type.castable_to(type.valuetype)
-            assert type.name is not None
-            expr = type.name+'('+expr+')'
-        return expr
+        return self.conversion_function(type,expr,orig_type)
 
     def visit_as_type(self, node, type):
         # check for type conversions
@@ -775,6 +732,29 @@ literal_printers = {
     std_logic: lambda v, l: "'1'" if v else "'0'",
 }
 
+def conv(format):
+    def convert(type,expr,orig=None):
+        return format.format(
+            x=expr,
+            l=type.indextypes[0].length if isinstance(type,VHDLArray) else None,
+        )
+    return convert
+standard_type_conversions = {
+    (integer,std_logic):conv('to_integer(to_unsigned({x},1))'),   # '1', 'H' -> 1, else 0
+    (integer,signed):conv('to_integer({x})'),   # one-to-one
+    (integer,unsigned):conv('to_integer({x})'), # one-to-one
+    (signed,integer):conv('to_signed({x},{l})'), # ?
+    (unsigned,std_logic):conv('to_unsigned({x},{l})'),   # '1','H' -> 1, else -> 0
+    (unsigned,integer):conv('to_unsigned({x},{l})'),   # ?
+    (std_logic,boolean):conv("to_std_ulogic({x})"), # true -> '1', false -> '0'
+    (integer,boolean):conv("to_integer(to_unsigned(to_std_ulogic({x}),1))"), # true -> '1', false -> '0'
+    (std_logic,integer):conv("get_index(to_unsigned({x},1),0)"), # truncates
+    (std_logic,unsigned):conv("get_index({x},0)"), # truncates
+#    (boolean,std_logic):conv("({x} = '1')"),
+#    (boolean,integer):conv('({x} /= 0)'),
+#    (boolean,unsigned):conv("(to_integer({x}) /= 0)"), # 0 -> '0', else -> '1'
+}
+
 
 class Converter:
     def typeof(self,sig):
@@ -807,24 +787,44 @@ class Converter:
         return n
 
     def _printexpr(self, ns, node, type=None):
-        printer = VHDLExprPrinter(ns,_MapProxy(self.typeof))
-        if type is not None:
+        printer = VHDLExprPrinter(ns,_MapProxy(self.typeof), self._convert_expr_type)
+        if type is not None and type is not True:
             return printer.visit_as_type(node,type)
-        return printer.visit(node)[0]
+        expr, etype = printer.visit(node)
+        if type is True:
+            return expr, etype
+        return expr
+
+    def _convert_expr_type(self, type, expr, orig_type):
+        if orig_type.compatible_with(type):
+            return expr
+        if orig_type.castable_to(type) and type.ultimate_base.name is not None:
+            return type.ultimate_base.name + '(' + expr + ')'
+        converter = standard_type_conversions.get((type.ultimate_base,orig_type.ultimate_base),None)
+        if converter is not None:
+            return converter(type,expr,orig_type)
+        if not isinstance(orig_type,VHDLArray) or not isinstance(type,VHDLArray):
+            raise TypeError("Don't know how to convert type %s to %s"%(orig_type,type))
+        if not orig_type.ultimate_base == type.ultimate_base:
+            raise TypeError("Don't know how to convert type %s to %s"%(orig_type,type))
+        # simply assume the presence of a resize function
+        expr = 'resize('+expr+','+str(type.indextypes[0].length)+')'
+        if not orig_type.valuetype.compatible_with(type.valuetype):
+            assert orig_type.castable_to(type.valuetype)
+            assert type.name is not None
+            expr = type.name+'('+expr+')'
+        return expr
 
     def _printnode(self, ns, level, node):
         if isinstance(node, _Assign):
             assignment = " <= "
             assert isinstance(node.l,(Signal,_Slice))
-            left,leftt = VHDLExprPrinter(ns,_MapProxy(self.typeof)).visit(node.l)
-#            lt = VHDLExprPrinter(ns,_MapProxy(self.typeof)).visit(node.l)[1]
-#            rt = VHDLExprPrinter(ns,_MapProxy(self.typeof)).visit(node.r)[1]
-#            print('Assign to ',ns.get_name(node.l),left,lt,rt)
+            left,leftt = self._printexpr(ns,node.l,type=True)
             return "\t" * level + left + assignment + self._printexpr(ns, node.r, type=leftt) + ";\n"
         elif isinstance(node, collections.Iterable):
             return "".join(self._printnode(ns, level, n) for n in node)
         elif isinstance(node, If):
-            r = "\t" * level + "if " + self._printexpr(ns, node.cond, boolean) + " then\n"
+            r = "\t" * level + "if " + self._printexpr(ns, node.cond, integer) + "/=0 then\n"
             r += self._printnode(ns, level + 1, node.t)
             if node.f:
                 r += "\t" * level + "else\n"
@@ -833,8 +833,7 @@ class Converter:
             return r
         elif isinstance(node, Case):
             if node.cases:
-                printer = VHDLExprPrinter(ns, _MapProxy(self.typeof))
-                test,testt = printer.visit(node.test)
+                test,testt = self._printexpr(ns, node.test, type=True)
 
                 r = "\t" * level + "case " + test + " is \n"
                 css = [(k, v) for k, v in node.cases.items() if isinstance(k, Constant)]
@@ -854,45 +853,6 @@ class Converter:
 
     def _printuse(self, extra=[]):
         r = """
-library ieee;
-use ieee.std_logic_1164.all;
-use ieee.numeric_std.all;
-
-package migen_helpers is
-function to_std_ulogic(v: boolean) return std_ulogic;
-function to_std_ulogic(v: integer) return std_ulogic;
-function to_unsigned(v: std_ulogic; length: natural) return unsigned;
-end migen_helpers;
-
-package body migen_helpers is
-function to_std_ulogic(v: boolean) return std_ulogic is
-begin
-  if v then
-    return '1';
-  else
-    return '0';
-  end if;
-end to_std_ulogic;
-
-function to_std_ulogic(v: integer) return std_ulogic is
-begin
-  if v /= 0 then
-    return '1';
-  else
-    return '0';
-  end if;
-end to_std_ulogic;
-
-function to_unsigned(v: std_ulogic; length:natural) return unsigned is
-begin
-  if (v = '1') or (v = 'H') then
-    return resize(unsigned'("1"),length);
-  else
-    return resize(unsigned'("0"),length);
-  end if;
-end to_unsigned;
-end migen_helpers;
-
 library ieee;
 use ieee.std_logic_1164.all;
 use ieee.numeric_std.all;
@@ -960,7 +920,7 @@ end {name};
                     return self._printexpr(ns,node.r,type)
                 return None
             if isinstance(node,If):
-                condition = self._printexpr(ns, node.cond, boolean)
+                condition = self._printexpr(ns, node.cond, integer) + '/=0'
                 if precondition:
                     condition = '(' + precondition + ' and ' + condition + ')'
                 return (
@@ -1086,50 +1046,17 @@ end {name};
 library ieee;
 use ieee.std_logic_1164.all;
 use ieee.numeric_std.all;
+use work.migen_helpers.all;
 
-entity {name} is
-begin
-end {name};
+entity {name} is begin end {name};
 
 architecture Migen of {name} is
-
-procedure clk_gen(
-    signal clk : out std_logic;
-    constant half_period : time;
---    signal run : in std_logic;
-    constant first_edge_advance : time := 0 fs;
-    constant initial_level: std_logic := '0'
-) is
-begin
-  -- Check the arguments
-  assert (half_period /= 0 fs) report "clk_gen: half_period is zero; time resolution to large for frequency" severity FAILURE;
-  -- Initial phase shift
-  clk <= initial_level;
-  wait for half_period - first_edge_advance;
-  if initial_level /= '0' then
-    clk <= '0';
-    wait for half_period;
-  end if;
-  -- Generate cycles
-  loop
-    -- Only high pulse if run is '1' or 'H'
---    if (run = '1') or (run = 'H') then
---      clk <= run;
---    end if;
-    clk <= '1';
-    wait for half_period;
-    -- Low part of cycle
-    clk <= '0';
-    wait for half_period;
-  end loop;
-end procedure;
-
 component {dut}
 \tport({dutport});
 end component;
 {signaldecl}
 begin
-\tdut: {dut} port map ({portmap});
+dut: {dut} port map ({portmap});
 """.format(
             name=tbname,
             dut=name,
@@ -1146,7 +1073,7 @@ begin
 
         for k in sorted(list_clock_domains(f)):
             clk = time.clocks[k]
-            src += """clk_gen({name}_clk, {dt} ns, {advance} ns, {initial}); """.format(
+            src += """clk_gen({name}_clk, {dt} ns, {advance} ns, {initial});\n""".format(
                 name=k,
                 dt=clk.half_period,
                 advance=clk.half_period - clk.time_before_trans,

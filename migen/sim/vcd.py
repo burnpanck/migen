@@ -157,13 +157,19 @@ def VCD_events(fh):
             time = int(token[1:])
             yield time
 
-        elif token[0] in '01xzXZ':
-            val = token[0] == '1'
+        elif token[0] in '01xzXZUXZWLH-':
+            if token[0] not in '01':
+                val = None
+            else:
+                val = token[0] == '1'
             code = token[1:]
             yield code,val
 
         elif token[0] in 'b':
-            val = int(token[1:],base=2)
+            if any(c in token[1:] for c in 'UXZWLH-'):
+                val = None
+            else:
+                val = int(token[1:],base=2)
             code = next(stream)
             yield code, val
 
@@ -184,10 +190,14 @@ class NumpySignalTrace:
         self.width = width
         self._time = np.empty(0,'i8')
         self._value = np.empty(0,dtype)
+        self.fail = []
 
     def append(self,time,value):
         k = self.size
         self._time = self._insert(self._time,k,time)
+        if value is None:
+            self.fail.append(k)
+            value = 0
         self._value = self._insert(self._value,k,value)
         self.size += 1
 
