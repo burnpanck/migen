@@ -5,10 +5,10 @@ import collections
 import abc
 
 from migen.fhdl.structure import *
-from migen.fhdl.structure import _Operator, _Slice, _Assign, _Fragment, _Value, _Statement
+from migen.fhdl.structure import _Operator, _Slice, _Assign, _Fragment, _Value, _Statement, _ArrayProxy
 from migen.fhdl.tools import *
 from migen.fhdl.visit import NodeTransformer
-from migen.fhdl.visit_generic import NodeTransformer as ContextualTransformer, visitor_for
+from migen.fhdl.visit_generic import NodeTransformer as NodeTranformerGeneric, visitor_for, recursor_for
 from migen.fhdl.namer import build_namespace
 from migen.fhdl.conv_output import ConvOutput
 from migen.fhdl.bitcontainer import value_bits_sign
@@ -38,27 +38,63 @@ class MigenExpressionType(abc.ABC):
     2. The behaviour of operations performed on the type (Migen-level operator overloading)
     """
     @abc.abstractproperty
-    def size(self):
+    def nbits(self):
         """ The number of bits required to completely represent the type.
         """
 
+    @abc.abstractmethod
+    def compatible_with(self,other):
+        """ Tests if the set of values representable by the two types overlap.
+
+        If the two sets do not overlap at all, then it is certainly an error to
+        assume a variable to be in the intersection of the two, as required
+        for type casting.
+        """
+
+    @abc.abstractmethod
+    def contained_in(self,other):
+        """ Tests if the set of values representable in self is contained in the set of other.
+
+        In this case, casting is guaranteed to work.
+        """
+
 class MigenInteger(MigenExpressionType):
-    def __init__(self,width):
+    def __init__(self,width,min=None,max=None):
+        if min is None:
+            min = self._min
+        else:
+            assert self._min <= min
+        if max is None:
+            max = self._max
+        else:
+            assert max <= self._max
         self._width = width
+        self.min = min
+        self.max = max
 
     @property
-    def size(self):
+    def nbits(self):
         return self._width
 
+    def compatible_with(self,other):
+        if not isinstance(other,MigenInteger):
+            return False
+        return self.max>=other.min and self.min<=other.max
+
+    def contained_in(self,other):
+        if not isinstance(other,MigenInteger):
+            return False
+        return self.min >= other.min and self.max <= other.max
+
     @abc.abstractproperty
-    def min(self):
+    def _min(self):
         """ Lowest possible value.
 
         The allowed range is [min .. max] with both ends inclusive.
         """
 
     @abc.abstractproperty
-    def max(self):
+    def _max(self):
         """ Highest possible value.
 
         The allowed range is [min .. max] with both ends inclusive.
@@ -66,15 +102,15 @@ class MigenInteger(MigenExpressionType):
 
 class Unsigned(MigenInteger):
     @property
-    def min(self): return 0
+    def _min(self): return 0
     @property
-    def max(self): return (1<<self._width) - 1
+    def _max(self): return (1<<self._width) - 1
 
 class Signed(MigenInteger):
     @property
-    def min(self): return -1<<(self._width-1)
+    def _min(self): return -1<<(self._width-1)
     @property
-    def max(self): return (1<<(self._width-1)) - 1
+    def _max(self): return (1<<(self._width-1)) - 1
 
 
 # -------------
@@ -351,6 +387,10 @@ class AbstractTypedExpression(_Value):
 
 class MigenExpression(AbstractTypedExpression):
     """ A proxy for any Migen expression, with added explicit type information.
+
+    The annotated type is required to exactly match the type inferred from the
+    semantics of the wrapped expression. If you want to change the semantics or
+    restrict the type, inject a type-cast node.
     """
     def __init__(self,expr,type):
         assert isinstance(expr,_Value) and not isinstance(expr,AbstractTypedExpression)
@@ -417,8 +457,120 @@ class TypeCast(AbstractTypedExpression):
     """ Changes the semantics of a value, while keeping it's representation unharmed.
     """
 
+# ---- NodeTransformer for extended hierarchy
+
+def visitor_for_wrapped(*wrapped_node_types):
+
+    """ Decorator to register a method to handle nodes wrapped within :py:class:`MigenExpression` nodes.
+
+    Any :py:class:`MigenExpression` node whose `expr` attribute matches any of the node classes given
+    as argument to this decorator will be handled by the decorated function.
+    The decorated function has signature `orig, node, ctxt`, where both `orig` and `node`
+    are the wrapping nodes of type :py:class:`MigenExpression`. `orig` is the node before nested
+    nodes were transformed, `node` is after nested transforms are applied.
+    """
+    return NodeTranformerGeneric.registering_decorator('_wrapped_node_visitors', wrapped_node_types)
+
+
+class VHDLNodeTransformer(NodeTranformerGeneric):
+    """ Extends the NodeTransformer to handler VHDL nodes properly.
+    """
+    @recursor_for(MigenExpression)
+    def recurse_Annotated(self,node,ctxt=None):
+        return MigenExpression(self.visit(node.expr),node.type)
+
+
+    @visitor_for(MigenExpression)
+    def visit_Annotated(self, orig, node, ctxt):
+        """ An annotated node. Delegates to the transform's registry based on the type of the wrapped expression."""
+        return type(self).find_handler(
+            '_wrapped_node_visitors',
+            node.expr,
+            type(self).visit_unknown_wrapped_node
+        )(self,orig,node,ctxt)
+
 # ---------------------------
-#
+# Add explicit types to tree
+# ---------------------------
+
+class ExplicitTyper(VHDLNodeTransformer):
+    """ Adds explicit type annotations to untyped Migen nodes.
+
+    """
+    def __init__(self,*,raise_on_type_mismatch=True):
+        """
+        raise_on_type_mismatch: If pre-existing type annotations do not match, raise an exception rather than just replacing
+        the annotation.
+        """
+        self.raise_on_type_mismatch = raise_on_type_mismatch
+
+    def type_wrap(self,node,type,ctxt):
+        """ Annotate node with type.
+        """
+        return MigenExpression(node,type)
+
+    @visitor_for(AbstractTypedExpression)
+    def visit_AlreadyTyped(self,orig,node,ctxt):
+        """ Leave alone... this transformer is only concerned with nodes that are not inherently typed. """
+        return node
+
+    @visitor_for(MigenExpression) # overrides visit_AlreadyTyped due to beeing more specific
+    def visit_PreviousAnnotation(self,orig,node,ctxt=None):
+        ret = node.expr # we'll remove outer layer of annotation, which is the previous annotation
+        assert isinstance(ret,MigenExpression)
+        if self.raise_on_type_mismatch and not ret.type==orig.type:
+            raise TypeError('Mismatching type annotations found for expression %s: %s != %s'%(ret.expr,ret.type,orig.type))
+        return node
+
+    @visitor_for(Constant)
+    def visit_Constant(self, orig, node, ctxt=None):
+        return self.type_wrap(node,(Signed if node.signed else Unsigned)(node.nbits,min=node.value,max=node.value),ctxt)
+
+    @visitor_for(Signal)
+    def visit_Signal(self, orig, node, ctxt=None):
+        return self.type_wrap(node,(Signed if node.signed else Unsigned)(node.nbits,min=node.min,max=node.max),ctxt)
+
+    @visitor_for(ClockSignal,ResetSignal)
+    def visit_BoolSignal(self, orig, node, ctxt):
+        return self.type_wrap(node,Unsigned(1,min=0,max=1),ctxt)
+
+    @visitor_for(_Operator)
+    def visit_Operator(self, orig, node, ctxt=None):
+        from .bitcontainer import operator_bits_sign
+        obs = [(n.type.size,isinstance(n.type,Signed)) for n in node.operands]
+        nbits, signed = operator_bits_sign(node.op, obs)
+        typ = (Signed if signed else Unsigned)(nbits)
+        return self.type_wrap(node,typ,ctxt)
+
+    @visitor_for(_Slice)
+    def visit_Slice(self, orig, node, ctxt=None):
+        typ = (Signed if isinstance(node.value.type,Signed) else Unsigned)(node.stop - node.start)
+        return self.type_wrap(node,typ,ctxt)
+
+    @visitor_for(Cat)
+    def visit_Cat(self, orig, node, ctxt=None):
+        typ = Unsigned(sum(sv.type.nbits for sv in node.l))
+        return self.type_wrap(node,typ,ctxt)
+
+    @visitor_for(Replicate)
+    def visit_Replicate(self, orig, node, ctxt=None):
+        typ = Unsigned(node.v.type.nbits*node.n)
+        return self.type_wrap(node,typ,ctxt)
+
+    @visitor_for(_ArrayProxy)
+    def visit_ArrayProxy(self, orig, node, ctxt=None):
+        typ = (
+            Signed if
+            any(isinstance(n.type,Signed) for n in node.choices)
+            else Unsigned
+        )(max(n.type.nbits for n in node.choices))
+        return self.type_wrap(node,typ,ctxt)
+
+    def visit_unknown_node(self, orig, node, ctxt=None):
+        raise TypeError("Don't know how to generate type for node %s"%node)
+
+# ---------------------------
+# Tree transforms for VHDL
 # ---------------------------
 
 class VHDLNodeContext:
@@ -433,22 +585,47 @@ class VHDLNodeContext:
         for k,v in kw.items():
             setattr(self,k,v)
 
-class ToVHDLConverter(ContextualTransformer):
+
+class ToVHDLConverter(VHDLNodeTransformer):
     """ Converts a Migen AST into an AST suitable for VHDL export
 
-    In the process, identifies types of expressions and a
-    suitable VHDL representation, and inserts type conversions where needed.
+    In this process, it assigns a suitable VHDL type to any expression.
     """
 
-    def type_wrap(self,node,ctxt,type):
-        if ctxt.wrapped:
-            return node
+    def __init__(self,*,one_bit_repr=std_logic):
+        """
+        one_bit_repr: Unsigned single bit numbers should be represented using the given VHDL type.
+          If None, leave it as unsigned 1-bit vector.
+        """
+        assert one_bit_repr is None or isinstance(one_bit_repr,VHDLType)
+        self.one_bit_repr = one_bit_repr
+        self.replaced_signals = {}
+
+    def VHDL_representation_for(self,migen_type):
+        """ Given a migen type, find a suitable VHDL representation.
+
+        If argument already has a specified VHDL representation, returns that one.
+        """
+        assert isinstance(migen_type,MigenExpressionType)
+        if isinstance(migen_type,VHDLTypeMapping):
+            return migen_type.vhdl
+        if not isinstance(migen_type,MigenInteger):
+            raise TypeError("Don't know how to map type %s to VHDL"%migen_type)
+        if isinstance(migen_type, Unsigned) and migen_type.nbits == 1:
+            # Verilog has no boolean type, so is this a 1-element array or a single wire?
+            if self.one_bit_repr is not None:
+                return self.one_bit_repr
+        typ = signed if isinstance(migen_type, Signed) else unsigned
+        return typ[migen_type.nbits-1:0]
+
+    def type_wrap(self,node,type,ctxt):
+        """ Annotate node with type.
+        """
         return MigenExpression(node,type)
 
-    @visitor_for(Constant)
-    def visit_Constant(self, node, ctxt):
-        return self.type_wrap(node,ctxt,(Signed if node.signed else Unsigned)(node.nbits))
-
+    @visitor_for_wrapped(Signal)
+    def wrapped_Signal(self, orig, node, ctxt):
+        return self.type_wrap(node,self.VHDL_representation_for(node.type))
 
     @visitor_for(_Operator)
     def visit_Operator(self, node, ctxt):

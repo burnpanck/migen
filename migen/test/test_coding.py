@@ -29,6 +29,19 @@ class EncCase(SimCase, unittest.TestCase):
                 yield
         self.run_with(gen())
 
+    class TestBenchWithStimulus(TestBench):
+        def __init__(self):
+            self.submodules.dut = dut = Encoder(8)
+
+            ctr = Signal(8)
+            self.sync += ctr.eq(ctr + 1)
+            self.sync += dut.i.eq(ctr)
+
+
+    def test_conversion(self):
+        tb = self.TestBenchWithStimulus
+        self.convert_run_and_compare(tb, cycles=1<<8)
+
 
 class PrioEncCase(SimCase, unittest.TestCase):
     class TestBench(Module):
