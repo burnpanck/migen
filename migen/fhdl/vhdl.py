@@ -8,7 +8,7 @@ from migen.fhdl.structure import *
 from migen.fhdl.structure import _Operator, _Slice, _Assign, _Fragment, _Value, _Statement, _ArrayProxy
 from migen.fhdl.tools import *
 from migen.fhdl.visit import NodeTransformer
-from migen.fhdl.visit_generic import NodeTransformer as NodeTranformerGeneric, visitor_for, recursor_for
+from migen.fhdl.visit_generic import NodeTransformer as NodeTranformerGeneric, visitor_for, recursor_for, context_for
 from migen.fhdl.namer import build_namespace
 from migen.fhdl.conv_output import ConvOutput
 from migen.fhdl.bitcontainer import value_bits_sign
@@ -360,30 +360,20 @@ unsigned = VHDLArray('unsigned',std_logic,natural)
 
 
 # -------------------
-# VHDL AST
+# explicitely typed AST
 # -------------------
-
-class VHDLTypeMapping(MigenExpressionType):
-    """ Represents a Migen expression type including information on how it is mapped to VHDL.
-
-    This includes the specification of both the Migen type and the VHDL type,
-    as well as an implicit description of the mapping between the two.
-
-    The semantics are still Migen semantics, governed by the Migen type.
-    """
-    def __init__(self,migen,vhdl):
-        assert isinstance(migen, MigenExpressionType)
-        assert isinstance(vhdl, VHDLType)
-        self.migen = migen
-        self.vhdl = vhdl
-
 
 class AbstractTypedExpression(_Value):
     """ AST node with explicit type information.
+
+    Futhermore, there is an optional field to hold information on how it is to be represented by the backend.
+    As such, it has no meaning for the actual model, and should only be added when transforming the tree
+    for a particular backend.
     """
-    def __init__(self,type):
+    def __init__(self,type,repr=None):
         assert isinstance(type, MigenExpressionType)
         self.type = type
+        self.repr = repr
 
 class MigenExpression(AbstractTypedExpression):
     """ A proxy for any Migen expression, with added explicit type information.
@@ -392,24 +382,49 @@ class MigenExpression(AbstractTypedExpression):
     semantics of the wrapped expression. If you want to change the semantics or
     restrict the type, inject a type-cast node.
     """
-    def __init__(self,expr,type):
+    def __init__(self,expr,type,repr=None):
         assert isinstance(expr,_Value) and not isinstance(expr,AbstractTypedExpression)
-        super().__init__(type)
+        AbstractTypedExpression.__init__(expr,type,repr)
         self.expr = expr
 
 class VHDLSignal(AbstractTypedExpression):
-    def __init__(self,name,type):
-        assert isinstance(type,VHDLTypeMapping)
-        super().__init__(type)
+    def __init__(self,name,type,repr=None):
+        AbstractTypedExpression.__init__(type,repr)
         self.name = name
 
 class Port(VHDLSignal):
-    def __init__(self,name,dir,type):
+    def __init__(self,name,dir,type,repr=None):
         assert dir in ['in', 'out', 'inout', 'buffer']
-        super().__init__(name,type)
+        VHDLSignal.__init__(name,type,repr)
         self.dir = dir
 
-class Entity:
+
+class Scope(abc.ABC):
+    """ Mixin class for AST nodes that form a scope or namespace. """
+    def get_object(self,name):
+        ret = self._get_object(name) or self.parent_scope and self.parent_scope.get_object(name)
+        if ret is None:
+            raise KeyError('Name "%s" is undefined in scope "%s"'%(name,self))
+        return ret
+
+    @property
+    def parent_scope(self):
+        return ReservedKeywords
+
+    @abc.abstractmethod
+    def _get_object(self, name):
+        pass
+
+class DictScope(dict,Scope):
+    def _get_object(self,name):
+        return self[name]
+
+ReservedKeyword = ()    # Singleton indicating that a name is a reserved keyword
+ReservedKeywords = DictScope({
+    k:ReservedKeyword for k in _reserved_keywords
+})
+
+class Entity(Scope):
     def __init__(self,name,ports=[]):
         assert all(isinstance(p,Port) for p in ports)
         self.name = name
@@ -434,60 +449,110 @@ class ComponentInstance(_Statement):
         self.component = component
         self.portmap = portmap
 
-
-class Architecture:
-    def __init__(self,entity,**kw):
-        name = kw.pop('name','Migen')
-        signals = kw.pop('signals',dict())
-        instances = kw.pop('instances',dict())
-        assert not kw
+class EntityBody(Scope):
+    def __init__(self,entity,*,statements=[],architecture='Migen',signals={},instances={},namespace={}):
+        """
+        :param entity: The entity which is implemented in this body
+        :param architecture: The architecture name
+        :param signals: The local signals (ports are defined on `entity`)
+        :param instances: Instantiations of components
+        :param namespace: Mapping of all names to their meaning inside the body.
+        :param statements: The (concurrent) statements (including processes) contained in the body.
+        """
         assert isinstance(entity,Entity)
         assert all(isinstance(s,VHDLSignal) for s in signals.values())
         assert all(isinstance(i,ComponentInstance) for i in instances.values())
-        self.name = name
+        self.architecture = architecture
         self.entity = entity
+        self.statements = statements
         self.signals = signals
         self.instances = instances
+        self.namespace = namespace
+
+    @property
+    def parent_scope(self):
+        return self.entity
+
+    def _get_object(self,name):
+        return self.signals.get(name,None) or self.instances.get(name,None)
 
 class TypeConversion(AbstractTypedExpression):
     """ Changes the representation of a value, while keeping it's semantics unharmed.
     """
+    def __init__(self,orig,repr):
+        assert isinstance(orig,AbstractTypedExpression)
+        super().__init__(orig.type,repr)
 
 class TypeCast(AbstractTypedExpression):
     """ Changes the semantics of a value, while keeping it's representation unharmed.
     """
+    def __init__(self,orig,type):
+        assert isinstance(orig, AbstractTypedExpression)
+        super().__init__(type, orig.repr)
+
+
+class SelectedAssignment(_Assign):
+    """ Essentially a case statement with a built-in assignment to a single target.
+
+    In VHDL, assignments, processes and component instantiations are the only
+    concurrent statements. Particularly, no case statements unless wrapped inside a process.
+    However, selected assignments are specially designed assignments for this purpose.
+    """
+
+class ConditionalAssignment(_Assign):
+    """ Essentially if-then-else with a built-in assignment to a single target.
+
+    In VHDL, assignments, processes and component instantiations are the only
+    concurrent statements. Particularly, no if statements unless wrapped inside a process.
+    However, conditional assignments are specially designed assignments for this purpose.
+    """
+    def __init__(self,l,default,condition_value_pairs):
+        assert all(len(v)==2 and all(isinstance(vv,_Value) for vv in v) for v in condition_value_pairs)
+        self.l = l
+        self.defaul = default
+        self.condition_value_pairs = condition_value_pairs
 
 # ---- NodeTransformer for extended hierarchy
 
-def visitor_for_wrapped(*wrapped_node_types):
+def visitor_for_wrapped(*wrapped_node_types,needs_original_node=True):
 
     """ Decorator to register a method to handle nodes wrapped within :py:class:`MigenExpression` nodes.
 
     Any :py:class:`MigenExpression` node whose `expr` attribute matches any of the node classes given
     as argument to this decorator will be handled by the decorated function.
-    The decorated function has signature `orig, node, ctxt`, where both `orig` and `node`
-    are the wrapping nodes of type :py:class:`MigenExpression`. `orig` is the node before nested
+    The decorated function receives either the single argument `node`, or both `orig` and `node`,
+    where both are the wrapping nodes of type :py:class:`MigenExpression`. `orig` is the node before nested
     nodes were transformed, `node` is after nested transforms are applied.
+    `orig` may be requested by setting the keyword argument `needs_original_node=True` on the decorator.
     """
-    return NodeTranformerGeneric.registering_decorator('_wrapped_node_visitors', wrapped_node_types)
-
+    return NodeTranformerGeneric.registering_decorator(
+        '_wrapped_node_visitors', wrapped_node_types,
+        _needs_original_node=needs_original_node,
+    )
 
 class VHDLNodeTransformer(NodeTranformerGeneric):
     """ Extends the NodeTransformer to handler VHDL nodes properly.
     """
     @recursor_for(MigenExpression)
-    def recurse_Annotated(self,node,ctxt=None):
+    def recurse_Annotated(self,node):
         return MigenExpression(self.visit(node.expr),node.type)
 
 
-    @visitor_for(MigenExpression)
-    def visit_Annotated(self, orig, node, ctxt):
+    @visitor_for(MigenExpression, needs_original_node=True)
+    def visit_Annotated(self, orig, node):
         """ An annotated node. Delegates to the transform's registry based on the type of the wrapped expression."""
-        return type(self).find_handler(
+        handler = type(self).find_handler(
             '_wrapped_node_visitors',
             node.expr,
             type(self).visit_unknown_wrapped_node
-        )(self,orig,node,ctxt)
+        )
+        if getattr(handler, '_needs_original_node', None):
+            handler(self, orig, node)
+        else:
+            handler(self, node)
+
+    def visit_unknown_wrapped_node(self,node):
+        return node
 
 # ---------------------------
 # Add explicit types to tree
@@ -504,18 +569,18 @@ class ExplicitTyper(VHDLNodeTransformer):
         """
         self.raise_on_type_mismatch = raise_on_type_mismatch
 
-    def type_wrap(self,node,type,ctxt):
+    def type_wrap(self,node,type):
         """ Annotate node with type.
         """
         return MigenExpression(node,type)
 
     @visitor_for(AbstractTypedExpression)
-    def visit_AlreadyTyped(self,orig,node,ctxt):
+    def visit_AlreadyTyped(self,node):
         """ Leave alone... this transformer is only concerned with nodes that are not inherently typed. """
         return node
 
-    @visitor_for(MigenExpression) # overrides visit_AlreadyTyped due to beeing more specific
-    def visit_PreviousAnnotation(self,orig,node,ctxt=None):
+    @visitor_for(MigenExpression,needs_original_node=True) # overrides visit_AlreadyTyped due to beeing more specific
+    def visit_PreviousAnnotation(self,orig,node):
         ret = node.expr # we'll remove outer layer of annotation, which is the previous annotation
         assert isinstance(ret,MigenExpression)
         if self.raise_on_type_mismatch and not ret.type==orig.type:
@@ -523,51 +588,57 @@ class ExplicitTyper(VHDLNodeTransformer):
         return node
 
     @visitor_for(Constant)
-    def visit_Constant(self, orig, node, ctxt=None):
-        return self.type_wrap(node,(Signed if node.signed else Unsigned)(node.nbits,min=node.value,max=node.value),ctxt)
+    def visit_Constant(self, node):
+        return self.type_wrap(node,(Signed if node.signed else Unsigned)(node.nbits,min=node.value,max=node.value))
 
     @visitor_for(Signal)
-    def visit_Signal(self, orig, node, ctxt=None):
-        return self.type_wrap(node,(Signed if node.signed else Unsigned)(node.nbits,min=node.min,max=node.max),ctxt)
+    def visit_Signal(self, node):
+        return self.type_wrap(node,(Signed if node.signed else Unsigned)(node.nbits,min=node.min,max=node.max))
 
     @visitor_for(ClockSignal,ResetSignal)
-    def visit_BoolSignal(self, orig, node, ctxt):
-        return self.type_wrap(node,Unsigned(1,min=0,max=1),ctxt)
+    def visit_BoolSignal(self, node):
+        return self.type_wrap(node,Unsigned(1,min=0,max=1))
 
     @visitor_for(_Operator)
-    def visit_Operator(self, orig, node, ctxt=None):
+    def visit_Operator(self, node):
         from .bitcontainer import operator_bits_sign
         obs = [(n.type.size,isinstance(n.type,Signed)) for n in node.operands]
         nbits, signed = operator_bits_sign(node.op, obs)
         typ = (Signed if signed else Unsigned)(nbits)
-        return self.type_wrap(node,typ,ctxt)
+        return self.type_wrap(node,typ)
 
     @visitor_for(_Slice)
-    def visit_Slice(self, orig, node, ctxt=None):
+    def visit_Slice(self, node):
         typ = (Signed if isinstance(node.value.type,Signed) else Unsigned)(node.stop - node.start)
-        return self.type_wrap(node,typ,ctxt)
+        return self.type_wrap(node,typ)
 
     @visitor_for(Cat)
-    def visit_Cat(self, orig, node, ctxt=None):
+    def visit_Cat(self, node):
         typ = Unsigned(sum(sv.type.nbits for sv in node.l))
-        return self.type_wrap(node,typ,ctxt)
+        return self.type_wrap(node,typ)
 
     @visitor_for(Replicate)
-    def visit_Replicate(self, orig, node, ctxt=None):
+    def visit_Replicate(self, node):
         typ = Unsigned(node.v.type.nbits*node.n)
-        return self.type_wrap(node,typ,ctxt)
+        return self.type_wrap(node,typ)
 
     @visitor_for(_ArrayProxy)
-    def visit_ArrayProxy(self, orig, node, ctxt=None):
+    def visit_ArrayProxy(self, node):
         typ = (
             Signed if
             any(isinstance(n.type,Signed) for n in node.choices)
             else Unsigned
         )(max(n.type.nbits for n in node.choices))
-        return self.type_wrap(node,typ,ctxt)
+        return self.type_wrap(node,typ)
 
-    def visit_unknown_node(self, orig, node, ctxt=None):
-        raise TypeError("Don't know how to generate type for node %s"%node)
+    @visitor_for(_Value)
+    def visit_other_Expression(self, node):
+        # catch all for _Value, assume every expression is a subclass of _Value
+        raise TypeError("Don't know how to generate type for expression node %s"%node)
+
+    def visit_unknown_node(self, node):
+        # most likely not an expression, just ignore.
+        return None
 
 # ---------------------------
 # Tree transforms for VHDL
@@ -585,6 +656,38 @@ class VHDLNodeContext:
         for k,v in kw.items():
             setattr(self,k,v)
 
+class VHDLReprGenerator:
+    def __init__(self,overrides={},*,single_bit=std_logic,unsigned=unsigned,signed=signed):
+        self.overrides = overrides
+        self.single_bit = single_bit
+        self.unsigned = unsigned
+        self.signed = signed
+        self.typer = ExplicitTyper(raise_on_type_mismatch=True)
+
+    def VHDL_representation_of_Signal(self,signal):
+        if not isinstance(signal,AbstractTypedExpression):
+            signal = self.typer.visit(signal)
+#        assert isinstance(signal,)
+        migen_type = signal.type
+        return migen_type, self.VHDL_representation_for(migen_type)
+
+    def VHDL_representation_for(self, migen_type):
+        """ Given a migen type, find a suitable VHDL representation.
+
+        If argument already has a specified VHDL representation, returns that one.
+        """
+        assert isinstance(migen_type,MigenExpressionType)
+        if not isinstance(migen_type,MigenInteger):
+            raise TypeError("Don't know how to map type %s to VHDL"%migen_type)
+        if isinstance(migen_type, Unsigned) and migen_type.nbits == 1:
+            # Verilog has no boolean type, so is this a 1-element array or a single wire?
+            if self.single_bit is not None:
+                return self.single_bit
+        typ = self.signed if isinstance(migen_type, Signed) else self.unsigned
+        return typ
+
+natural_repr = VHDLReprGenerator()
+all_slv = VHDLReprGenerator(unsigned=std_logic_vector,signed=std_logic_vector)
 
 class ToVHDLConverter(VHDLNodeTransformer):
     """ Converts a Migen AST into an AST suitable for VHDL export
@@ -592,156 +695,135 @@ class ToVHDLConverter(VHDLNodeTransformer):
     In this process, it assigns a suitable VHDL type to any expression.
     """
 
-    def __init__(self,*,one_bit_repr=std_logic):
-        """
-        one_bit_repr: Unsigned single bit numbers should be represented using the given VHDL type.
-          If None, leave it as unsigned 1-bit vector.
-        """
-        assert one_bit_repr is None or isinstance(one_bit_repr,VHDLType)
-        self.one_bit_repr = one_bit_repr
-        self.replaced_signals = {}
+    def __init__(self,*,vhdl_repr=natural_repr,replaced_signals={}):
+        # configuration (constants)
+        self.vhdl_repr = vhdl_repr
 
-    def VHDL_representation_for(self,migen_type):
-        """ Given a migen type, find a suitable VHDL representation.
+        # global variables
+        self.replaced_signals = replaced_signals
 
-        If argument already has a specified VHDL representation, returns that one.
-        """
-        assert isinstance(migen_type,MigenExpressionType)
-        if isinstance(migen_type,VHDLTypeMapping):
-            return migen_type.vhdl
-        if not isinstance(migen_type,MigenInteger):
-            raise TypeError("Don't know how to map type %s to VHDL"%migen_type)
-        if isinstance(migen_type, Unsigned) and migen_type.nbits == 1:
-            # Verilog has no boolean type, so is this a 1-element array or a single wire?
-            if self.one_bit_repr is not None:
-                return self.one_bit_repr
-        typ = signed if isinstance(migen_type, Signed) else unsigned
-        return typ[migen_type.nbits-1:0]
+        # context variables
+        self.entity = None  # the entity body we're currently building
 
-    def type_wrap(self,node,type,ctxt):
-        """ Annotate node with type.
-        """
-        return MigenExpression(node,type)
+    @context_for(EntityBody)
+    def EntityBody_ctxt(self, node):
+        return dict(
+            entity = node,
+        )
+
+    def assign_VHDL_repr(self, node):
+        node.repr = self.vhdl_repr.VHDL_representation_for(node.type)
+
+    @visitor_for(AbstractTypedExpression)
+    def visit_Typed(self, node):
+        self.assign_VHDL_repr(node)
+        return node
+
+    @visitor_for(MigenExpression,needs_original_node=True)
+    def visit_Annotated(self, orig, node):
+        # nested nodes have already been processed, now generate an appropriate VHDL type for this node
+        self.assign_VHDL_repr(node)
+        # now delegate to visitors
+        return super().visit_Annotated(orig,node)
 
     @visitor_for_wrapped(Signal)
-    def wrapped_Signal(self, orig, node, ctxt):
-        return self.type_wrap(node,self.VHDL_representation_for(node.type))
+    def wrapped_Signal(self, node):
+        sig = node.expr
+        repl = self.replaced_signals.get(sig,None)
+        if repl is None:
+            # this Signal already has a replacement.
+            # TODO: should we again check if the type in this wrapper conforms to the replacement signal?
+            return repl
+        # this Signal does not yet have a replacement.
+        ret = VHDLSignal(
+            name = self.ns.get_name(sig),
+            type = node.type,
+            repr = self.vhdl_repr.VHDL_representation_for(node.type),
+        )
+        # add to replacement map
+        self.replaced_signals[sig] = ret
+        # add signal to entity
+        assert not ret.name in self.entity.ports
+        assert not ret.name in self.entity.signals
+        self.entity.signals[ret.name] = ret
+        return ret
 
-    @visitor_for(_Operator)
-    def visit_Operator(self, node, ctxt):
-        verilog_bits, verilog_signed = value_bits_sign(node)
-        op = Verilog2VHDL_operator_map[node.op]  # TODO: op=='m'
-        if op in {'and','or','nand','nor','xor','xnor'}:
-            # logical operators
-            left,right = node.operands
-            lex,type = self.visit(left)
-            rex = self.visit_as_type(right,type)
-            return '('+lex + ' ' + op + ' ' + rex+')', type
-        elif op in {'<','<=','=','/=','>','>='}:
-            # relational operators
-            left,right = node.operands
-            lex,type = self.visit(left)
-            rex = self.visit_as_type(right,type)
-            return '('+lex + op + rex+')', boolean
-        elif op in {'sll','srl','sla','sra','rol','ror'}:
-            # shift operators
-            left,right = node.operands
-            lex,type = self.visit(left)
-            rex = self.visit_as_type(right,integer)
-            return '('+lex + ' ' + op + ' ' + rex+')', type
-        elif op in {'+','-'} and len(node.operands)==2:
-            # addition operators
-            left,right = node.operands
-            if False:
-                # VHDL semantics
-                lex,type = self.visit(left)
-                rex = self.visit_as_type(right,type)
-            else:
-                # emulate Verilog semantics in VHDL
-                type = (signed if verilog_signed else unsigned)[verilog_bits-1:0]
-                lex = self.visit_as_type(left,type)
-                rex = self.visit_as_type(right,type)
-            return '('+lex + op + rex+')', type
-        elif op in {'&'}:
-            # concatenation operator (same precedence as addition operators)
-            raise NotImplementedError(type(self).__name__ + '.visit_Operator: operator '+op)
-        elif op in {'+','-'} and len(node.operands)==1:
-            # unary operators
-            right, = node.operands
-            ex,type = self.visit(right)
-            return '(' + op + ex+')', type
-        elif op in {'*','/','mod','rem'}:
-            # multiplying operators
-            raise NotImplementedError(type(self).__name__ + '.visit_Operator: operator '+op)
-        elif op in {'not'}:
-            right, = node.operands
-            ex,type = self.visit(right)
-            return '(' + op + ' ' + ex+')', type
-        elif op in {'**','abs'}:
-            # misc operators
-            raise NotImplementedError(type(self).__name__ + '.visit_Operator: operator '+op)
-        else:
-            raise TypeError('Unknown operator "%s" with %d operands'%(node.op,len(node.operands)))
 
-    def visit_Slice(self, node):
-        expr,type = self.visit(node.value)
-        if not isinstance(type,VHDLArray):
-            raise TypeError('Cannot slice value of non-array type %s'%type)
-        idx, = type.indextypes
-        if node.stop - node.start == 1:
-            # this is not a slice, but an indexing operation!
-            return expr + '(' + str(node.start) + ')', type.valuetype
-        return expr + '(' + str(node.stop-1) + ' downto ' + str(node.start) + ')', type.ultimate_base[node.stop-1:node.start]
+class Converter:
+    def __init__(self,*,io_repr=all_slv,create_clock_domains=True,special_overrides={}):
+        self.io_repr = io_repr
+        self.create_clock_domains = create_clock_domains
+        self.special_overrides = special_overrides
 
-    def visit_Cat(self, node):
-        pieces = []
-        nbits = 0
-        for o in node.l:
-            expr,type = self.visit(o)
-            if not isinstance(type,VHDLArray):
-                pieces.append(self._convert_type(std_logic,expr,type))
- #               pieces.append(expr)
-                nbits += 1
-            else:
-                l = type.indextypes[0].length
-                pieces.append(self._convert_type(unsigned[l-1:0],expr,type))
-#                pieces.append(expr)
-                nbits += l
-        expr = "unsigned'(" + '&'.join(reversed(pieces)) + ')';
-        return expr, unsigned[nbits-1:0]
+    def convert(self,f,ios,name='top'):
+        r = ConvOutput()
+        if not isinstance(f, _Fragment):
+            f = f.get_fragment()
+        if ios is None:
+            ios = set()
+        r.fragment = f
+        r.name = name
 
-    def visit_Replicate(self, node):
-        raise NotImplementedError(type(self).__name__+'.visit_Replicate')
+        for cd_name in sorted(list_clock_domains(f)):
+            try:
+                f.clock_domains[cd_name]
+            except KeyError:
+                if self.create_clock_domains:
+                    cd = ClockDomain(cd_name)
+                    f.clock_domains.append(cd)
+                    ios |= {cd.clk, cd.rst}
+                else:
+                    raise KeyError("Unresolved clock domain: '" + cd_name + "'")
 
-    def visit_Assign(self, node):
-        return self._cannot_visit(node)
 
-    def visit_If(self, node):
-        return self._cannot_visit(node)
+        f = lower_complex_slices(f)
+        insert_resets(f)
+        f = lower_basics(f)
+        fs, lowered_specials = lower_specials(self.special_overrides, f.specials)
+        f += lower_basics(fs)
 
-    def visit_Case(self, node):
-        return self._cannot_visit(node)
+        # add explicit typing information
+        f = ExplicitTyper().visit(f)
 
-    def visit_Fragment(self, node):
-        return self._cannot_visit(node)
+        r.lowered_fragment = f
 
-    def visit_statements(self, node):
-        return self._cannot_visit(node)
+        # generate outer structure
+        ns = build_namespace(list_signals(f) \
+                             | list_special_ios(f, True, True, True) \
+                             | ios, _reserved_keywords)
+        ns.clock_domains = f.clock_domains
+        r.ns = ns
 
-    def visit_clock_domains(self, node):
-        return self._cannot_visit(node)
+        ports = []
+        replaced_signals = {}
+        for io in sorted(ios, key=lambda x: x.duid):
+            if io.name_override is None:
+                io_name = io.backtrace[-1][0]
+                if io_name:
+                    io.name_override = io_name
+            typ, rep = self.io_repr.VHDL_representation_for(io)
+            p = Port(
+                name = ns.get_name(io),
+                dir = 'out' if io in outputs else 'in',
+                type = typ,
+                repr = rep,
+            )
+            replaced_signals[io] = p
+            ports.append(p)
+        r.ios = ios
 
-    def visit_ArrayProxy(self, node):
-        raise NotImplementedError(type(self).__name__+'.visit_ArrayProxy')
-        return _ArrayProxy([self.visit(choice) for choice in node.choices],
-            self.visit(node.key))
+        entity = Entity(name=name,ports=ports)
+        entity_body = EntityBody(entity=entity,statements=[f])
 
-    def visit_unknown(self, node):
-        return self._cannot_visit(node)
+        # convert body
+        entity_body = ToVHDLConverter(
+            vhdl_repr=self.vhdl_repr,
+            replaced_signals=replaced_signals,
+        ).visit(entity_body)
+        r.replaced_signals = replaced_signals
+        r.converted = entity_body
 
-    def _cannot_visit(self, node):
-        raise TypeError('Node of type "%s" cannot be written as a VHDL expression'%type(node).__name__)
-
+        return r
 
 Verilog2VHDL_operator_map = {v[0]:v[-1] for v in (v.split(':') for v in '''
  &:and |:or ^:xor

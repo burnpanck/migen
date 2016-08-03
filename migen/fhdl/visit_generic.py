@@ -46,28 +46,39 @@ class WithRegisteredMethods(type):
         return default
 
     @staticmethod
-    def registering_decorator(registry_name,node_types):
-        def registerer(dct,key,value):
+    def registering_decorator(registry_name,node_types,**metadata):
+        def registerer(dct, key, fun):
             registry = dct.setdefault(registry_name,{})
             for node in node_types:
-                registry[node] = value
-            del value._register
-            return value
+                registry[node] = fun
+            del fun._register
+            return fun
         def decorate(fun):
             fun._register = registerer
+            for k,v in metadata.items():
+                setattr(fun,k,v)
             return fun
         return decorate
 
-def visitor_for(*node_types):
+def visitor_for(*node_types,needs_original_node=False):
     """ Decorator marking a method of a NodeTransformer to handle a set of node types.
     """
-    return WithRegisteredMethods.registering_decorator('_node_visitors',node_types)
+    return WithRegisteredMethods.registering_decorator(
+        '_node_visitors',node_types,
+        _needs_original_node=needs_original_node,
+    )
 
 def recursor_for(*node_types):
     """ Decorator marking a method of a NodeTransformer to be responsible for recursively calling
     `visit` for sub-nodes of nodes of the given set of types.
     """
     return WithRegisteredMethods.registering_decorator('_node_recursors',node_types)
+
+def context_for(*node_types):
+    """ Decorator marking a method of a NodeTransformer to be responsible for generating the
+    new context values for all child nodes of the given node, and the node itself.
+    """
+    return WithRegisteredMethods.registering_decorator('_node_context',node_types)
 
 
 class NodeTransformer(metaclass=WithRegisteredMethods):
@@ -89,35 +100,60 @@ class NodeTransformer(metaclass=WithRegisteredMethods):
     StatementNodes = (_Statement,)
     StructuralNodes = (_Fragment,list,dict)
 
-    def visit_node(self, orig, node, ctxt=None):
-        return type(self).find_handler('_node_visitors',node,type(self).visit_unknown_node)(self,orig,node,ctxt)
+    def visit_node(self, orig, node):
+        handler = type(self).find_handler('_node_visitors',node,type(self).visit_unknown_node)
+        if getattr(handler,'_needs_original_node',None):
+            handler(self,orig,node)
+        else:
+            handler(self,node)
 
-    def visit(self, node, ctxt=None):
-        with self.subcontext(ctxt,node) as subctxt:
-            recursed = type(self).find_handler('_node_recursors',node,type(self).recurse_unknown_node)(self,node,subctxt)
-        return self.visit_node(node,recursed,ctxt=ctxt)
+    def visit(self, node):
+        context = type(self).find_handler('_node_context',node,type(self).context_for_unknown_node)(self,node)
+        with self.subcontext(node,context):
+            recursed = type(self).find_handler('_node_recursors',node,type(self).recurse_unknown_node)(self,node)
+            return self.visit_node(node,recursed)
 
-    def visit_unknown_node(self, orig, node, ctxt):
+    def visit_unknown_node(self, node):
         return node
+
+    def contex_for_unknown_node(self, node):
+        return {}
 
     def recurse_unknown_node(self, node, ctxt):
         raise TypeError("Don't know how to recurse into children of nodes of type %s"%type(node))
 
     @contextmanager
-    def subcontext(self,ctxt,node):
-        """ Generate context for inner nodes, given an outer context and a current node.
+    def subcontext(self,node,context):
+        """ Updates contextual variables for visitors of contained nodes.
+        Registered context generators may produce additional context values.
 
-        Default implementation generates a list of parents
+        Default implementation generates a list of parents in the context variable `ancestry`,
+        and updates any other variable from dictionary supplied by registered context generators.
 
         .. Warning: This implementation modifies the supplied list in-place
         """
-        if ctxt is None:
-            ctxt = []
-        ctxt.append(node)
+        self.ancestry = ancestry = getattr(self,'ancestry',[])
+        ancestry.append(node)
+        Inexistent = ()
+        previous_context = {k:getattr(self,k,Inexistent) for k in context}
         try:
-            yield ctxt
+            for k,v in context.items():
+                setattr(self,k,v)
+            yield
         finally:
-            ctxt.pop()
+            ancestry.pop()
+            fail = {}
+            for k,v in previous_context.items():
+                try:
+                    if v is Inexistent:
+                        delattr(self,k)
+                    else:
+                        setattr(self,k,v)
+                except Exception as ex:
+                    # Ignore, for now, we still want to revert the rest
+                    fail[k] = (v,ex)
+            if fail:
+                raise RuntimeError('Could not revert context variables: '+str(fail))
 
     @recursor_for(Constant, Signal, ClockSignal, ResetSignal)
     def recurse_Leaf(self, node, ctxt=None):
