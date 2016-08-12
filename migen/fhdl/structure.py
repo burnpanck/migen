@@ -409,7 +409,6 @@ class ResetSignal(_Value):
 
 # statements
 
-
 class _Statement:
     pass
 

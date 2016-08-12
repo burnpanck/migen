@@ -24,7 +24,7 @@ class WithRegisteredMethods(type):
 
     @classmethod
     def __prepare__(typ, name, bases):
-        ret = typ.RegisteringDict(typ._registries)
+        ret = typ.RegisteringDict()
         return ret
 
     def __new__(typ, name, bases, dct):
@@ -80,6 +80,12 @@ def context_for(*node_types):
     """
     return WithRegisteredMethods.registering_decorator('_node_context',node_types)
 
+def combiner_for(*node_types):
+    """ Decorator marking a method of a NodeTransformer to be responsible for merging the results
+    of recursive visitor calls into the input for the visitors.
+    """
+    return WithRegisteredMethods.registering_decorator('_node_combiners',node_types)
+
 
 class NodeTransformer(metaclass=WithRegisteredMethods):
     """ Base class for node transformers, similar to :py:class:`.visit.NodeTransformer`, but allows more fine-grained
@@ -113,6 +119,10 @@ class NodeTransformer(metaclass=WithRegisteredMethods):
             recursed = type(self).find_handler('_node_recursors',node,type(self).recurse_unknown_node)(self,node)
             return self.visit_node(node,recursed)
 
+    def combine(self, orig, *args, **kw):
+        combiner = type(self).find_handler('_node_combiners',orig,type(self).combine_unknown_node)
+        return combiner(orig, *args, **kw)
+
     def visit_unknown_node(self, node):
         return node
 
@@ -121,6 +131,9 @@ class NodeTransformer(metaclass=WithRegisteredMethods):
 
     def recurse_unknown_node(self, node, ctxt):
         raise TypeError("Don't know how to recurse into children of nodes of type %s"%type(node))
+
+    def combine_unknown_node(self, orig, *args, **kw):
+        return type(orig)(*args,**kw)
 
     @contextmanager
     def subcontext(self,node,context):
@@ -158,12 +171,15 @@ class NodeTransformer(metaclass=WithRegisteredMethods):
     @recursor_for(Constant, Signal, ClockSignal, ResetSignal)
     def recurse_Leaf(self, node, ctxt=None):
         return node
+    @combiner_for(Constant, Signal, ClockSignal, ResetSignal)
+    def combine_Leaf(self, orig, *args, **kw):
+        raise TypeError('Cannot rebuild leaf nodes')
 
     @recursor_for(_Operator)
     def recurse_Operator(self, node, ctxt=None):
         assert all(isinstance(n,self.ExpressionNodes) for n in node.operands)
         with self.subcontext(ctxt,node) as ctxt:
-            return type(node)(node.op, [self.visit(o, ctxt) for o in node.operands])
+            return self.combine(node, node.op, [self.visit(o, ctxt) for o in node.operands])
 
     @recursor_for(_Slice)
     def recurse_Slice(self, node, ctxt=None):
@@ -171,27 +187,27 @@ class NodeTransformer(metaclass=WithRegisteredMethods):
         assert isinstance(node.start,int)
         assert isinstance(node.stop,int)
         with self.subcontext(ctxt,node) as ctxt:
-            return type(node)(self.visit(node.value,ctxt), node.start, node.stop)
+            return self.combine(node,self.visit(node.value,ctxt), node.start, node.stop)
 
     @recursor_for(Cat)
     def recurse_Cat(self, node, ctxt=None):
         assert all(isinstance(n,self.ExpressionNodes) for n in node.l)
         with self.subcontext(ctxt,node) as ctxt:
-            return type(node)(*[self.visit(e,ctxt) for e in node.l])
+            return self.combine(node,*[self.visit(e,ctxt) for e in node.l])
 
     @recursor_for(Replicate)
     def recurse_Replicate(self, node, ctxt=None):
         assert isinstance(node.v,self.ExpressionNodes)
         assert isinstance(node.n,int)
         with self.subcontext(ctxt,node) as ctxt:
-            return type(node)(self.visit(node.v, ctxt), node.n)
+            return self.combine(node,self.visit(node.v, ctxt), node.n)
 
     @recursor_for(_Assign)
     def recurse_Assign(self, node, ctxt=None):
         assert isinstance(node.l,self.ExpressionNodes)
         assert isinstance(node.r,self.ExpressionNodes)
         with self.subcontext(ctxt,node) as ctxt:
-            return type(node)(self.visit(node.l, ctxt), self.visit(node.r))
+            return self.combine(node,self.visit(node.l, ctxt), self.visit(node.r))
 
     @recursor_for(If)
     def recurse_If(self, node, ctxt=None):
@@ -199,10 +215,18 @@ class NodeTransformer(metaclass=WithRegisteredMethods):
         assert isinstance(node.t,self.StatementNodes)
         assert isinstance(node.f,self.StatementNodes)
         with self.subcontext(ctxt,node) as ctxt:
-            r = type(node)(self.visit(node.cond, ctxt))
-            r.t = self.visit(node.t, ctxt)
-            r.f = self.visit(node.f, ctxt)
+            return self.combine(node,
+                cond = self.visit(node.cond, ctxt),
+                t = self.visit(node.t, ctxt),
+                f = self.visit(node.f, ctxt),
+            )
         return r
+    @combiner_for(If)
+    def combine_If(self,orig,cond,t,f):
+        ret = type(orig)(cond)
+        ret.t = t
+        ret.f = f
+        return ret
 
     @recursor_for(Case)
     def recurse_Case(self, node, ctxt=None):
@@ -212,17 +236,22 @@ class NodeTransformer(metaclass=WithRegisteredMethods):
             cases = {v: self.visit(statements, ctxt)
                      for v, statements in sorted(node.cases.items(),
                                                  key=lambda x: str(x[0]))}
-            r = type(node)(self.visit(node.test, ctxt), cases)
-            return r
+            return self.combine(node,self.visit(node.test, ctxt), cases)
 
     @recursor_for(_Fragment)
     def recurse_Fragment(self, node, ctxt=None):
         assert isinstance(node.comb,self.StructuralNodes+self.StatementNodes)
         assert isinstance(node.sync,self.StructuralNodes+self.StatementNodes)
-        r = copy(node)
         with self.subcontext(ctxt,node) as ctxt:
-            r.comb = self.visit(node.comb, ctxt)
-            r.sync = self.visit(node.sync, ctxt)
+            return self.combine(node,
+                comb = self.visit(node.comb, ctxt),
+                sync = self.visit(node.sync, ctxt),
+            )
+    @combiner_for(_Fragment)
+    def combine_Fragment(self, orig, comb, sync):
+        r = copy(orig)
+        r.comb = comb
+        r.sync = sync
         return r
 
     # NOTE: this will always return a list, even if node is a tuple
@@ -249,7 +278,7 @@ class NodeTransformer(metaclass=WithRegisteredMethods):
         assert isinstance(node.key,self.ExpressionNodes)
         assert all(isinstance(n,self.ExpressionNodes) for n in node.choices)
         with self.subcontext(ctxt,node) as ctxt:
-            return type(node)(
+            return self.combine(node,
                 [self.visit(choice, ctxt) for choice in node.choices],
                 self.visit(node.key, ctxt)
             )

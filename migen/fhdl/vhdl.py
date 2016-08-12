@@ -8,7 +8,10 @@ from migen.fhdl.structure import *
 from migen.fhdl.structure import _Operator, _Slice, _Assign, _Fragment, _Value, _Statement, _ArrayProxy
 from migen.fhdl.tools import *
 from migen.fhdl.visit import NodeTransformer
-from migen.fhdl.visit_generic import NodeTransformer as NodeTranformerGeneric, visitor_for, recursor_for, context_for
+from migen.fhdl.visit_generic import (
+    NodeTransformer as NodeTranformerGeneric,
+    visitor_for, recursor_for, context_for, combiner_for,
+)
 from migen.fhdl.namer import build_namespace
 from migen.fhdl.conv_output import ConvOutput
 from migen.fhdl.bitcontainer import value_bits_sign
@@ -57,6 +60,22 @@ class MigenExpressionType(abc.ABC):
 
         In this case, casting is guaranteed to work.
         """
+
+class MigenBool(MigenExpressionType):
+    @property
+    def nbits(self):
+        return 1
+
+    def compatible_with(self, other):
+        if isinstance(other, MigenBool):
+            return True
+        return False
+
+    def contained_in(self, other):
+        if isinstance(other, MigenBool):
+            return True
+        return False
+
 
 class MigenInteger(MigenExpressionType):
     def __init__(self,width,min=None,max=None):
@@ -476,20 +495,40 @@ class EntityBody(Scope):
     def _get_object(self,name):
         return self.signals.get(name,None) or self.instances.get(name,None)
 
-class TypeConversion(AbstractTypedExpression):
-    """ Changes the representation of a value, while keeping it's semantics unharmed.
-    """
-    def __init__(self,orig,repr):
-        assert isinstance(orig,AbstractTypedExpression)
-        super().__init__(orig.type,repr)
+class TypeChange(AbstractTypedExpression):
+    """ Replaces the representation and semantics of a type while preserving the
+    represented value.
 
-class TypeCast(AbstractTypedExpression):
-    """ Changes the semantics of a value, while keeping it's representation unharmed.
+    Note that this might involve some logic in the underlying represenation or might
+    simply be a type cast for the underlying representation.
     """
-    def __init__(self,orig,type):
-        assert isinstance(orig, AbstractTypedExpression)
-        super().__init__(type, orig.repr)
+    def __init__(self,expr,*,type=None,repr=None):
+        assert isinstance(expr,AbstractTypedExpression)
+        super().__init__(
+            type=type if type is not None else orig.type,
+            repr=repr if repr is not None else orig.repr,
+        )
+        self.expr = expr
 
+    @classmethod
+    def if_needed(cls, expr, *, type=None, repr=None):
+        ret = cls(expr, type=type, repr=repr)
+        if ret.type == expr.type and ret.repr == expr.repr:
+            return expr
+        return ret
+
+class TestIfNonzero(TypeChange):
+    """ Explicit test for nonzero integer values, returning a boolean result.
+
+    Note that migen's comparison operators return integers (either 0 or 1).
+    If statements test for non-zero integers, while assigning to 1-bit registers
+    truncates to the LSB.
+    """
+    def __init__(self,expr,*,repr=None):
+        super().__init__(
+            type=MigenBool(),
+            repr=repr
+        )
 
 class SelectedAssignment(_Assign):
     """ Essentially a case statement with a built-in assignment to a single target.
@@ -636,6 +675,12 @@ class ExplicitTyper(VHDLNodeTransformer):
         # catch all for _Value, assume every expression is a subclass of _Value
         raise TypeError("Don't know how to generate type for expression node %s"%node)
 
+    @visitor_for(If)
+    def visit_If(self, node):
+        # make implicit test explicit
+        node.cond = TestIfNonzero(node.cond)
+        return node
+
     def visit_unknown_node(self, node):
         # most likely not an expression, just ignore.
         return None
@@ -644,21 +689,23 @@ class ExplicitTyper(VHDLNodeTransformer):
 # Tree transforms for VHDL
 # ---------------------------
 
-class VHDLNodeContext:
-    concurrent = False  # are we in a concurrent situation or not?
-    allowed_type = None # for expressions, either a single type or a tuple of types indicating the VHDL types that are valid at this point
-    ns = None           # the currently active namespace
-    def __init__(self,**kw):
-        self.ns = {}
-        self.update(**kw)
+if False:
+    class VHDLNodeContext:
+        concurrent = False  # are we in a concurrent situation or not?
+        allowed_type = None # for expressions, either a single type or a tuple of types indicating the VHDL types that are valid at this point
+        ns = None           # the currently active namespace
+        def __init__(self,**kw):
+            self.ns = {}
+            self.update(**kw)
 
-    def update(self,**kw):
-        for k,v in kw.items():
-            setattr(self,k,v)
+        def update(self,**kw):
+            for k,v in kw.items():
+                setattr(self,k,v)
 
 class VHDLReprGenerator:
-    def __init__(self,overrides={},*,single_bit=std_logic,unsigned=unsigned,signed=signed):
+    def __init__(self,overrides={},*,single_bit=std_logic,unsigned=unsigned,signed=signed,boolean=boolean):
         self.overrides = overrides
+        self.boolean = boolean
         self.single_bit = single_bit
         self.unsigned = unsigned
         self.signed = signed
@@ -677,6 +724,8 @@ class VHDLReprGenerator:
         If argument already has a specified VHDL representation, returns that one.
         """
         assert isinstance(migen_type,MigenExpressionType)
+        if isinstance(migen_type,MigenBool):
+            return self.boolean
         if not isinstance(migen_type,MigenInteger):
             raise TypeError("Don't know how to map type %s to VHDL"%migen_type)
         if isinstance(migen_type, Unsigned) and migen_type.nbits == 1:
@@ -684,10 +733,11 @@ class VHDLReprGenerator:
             if self.single_bit is not None:
                 return self.single_bit
         typ = self.signed if isinstance(migen_type, Signed) else self.unsigned
-        return typ
+        return typ[migen_type.nbits-1:0]
 
-natural_repr = VHDLReprGenerator()
-all_slv = VHDLReprGenerator(unsigned=std_logic_vector,signed=std_logic_vector)
+natural_repr = VHDLReprGenerator(single_bit=std_logic,unsigned=unsigned,signed=signed,boolean=boolean)
+only_numeric = VHDLReprGenerator(single_bit=None,unsigned=unsigned,signed=signed,boolean=unsigned[0:0])
+all_slv = VHDLReprGenerator(single_bit=std_logic,unsigned=std_logic_vector,signed=std_logic_vector,boolean=std_logic)
 
 class ToVHDLConverter(VHDLNodeTransformer):
     """ Converts a Migen AST into an AST suitable for VHDL export
@@ -712,7 +762,8 @@ class ToVHDLConverter(VHDLNodeTransformer):
         )
 
     def assign_VHDL_repr(self, node):
-        node.repr = self.vhdl_repr.VHDL_representation_for(node.type)
+        if node.repr is None:
+            node.repr = self.vhdl_repr.VHDL_representation_for(node.type)
 
     @visitor_for(AbstractTypedExpression)
     def visit_Typed(self, node):
@@ -730,7 +781,7 @@ class ToVHDLConverter(VHDLNodeTransformer):
     def wrapped_Signal(self, node):
         sig = node.expr
         repl = self.replaced_signals.get(sig,None)
-        if repl is None:
+        if repl is not None:
             # this Signal already has a replacement.
             # TODO: should we again check if the type in this wrapper conforms to the replacement signal?
             return repl
@@ -747,6 +798,47 @@ class ToVHDLConverter(VHDLNodeTransformer):
         assert not ret.name in self.entity.signals
         self.entity.signals[ret.name] = ret
         return ret
+
+    @visitor_for_wrapped(_Operator)
+    def visit_Operator(self, node):
+        expr = node.expr
+        repr = node.repr
+        verilog_bits, verilog_signed = value_bits_sign(expr)
+        op = Verilog2VHDL_operator_map[op]  # TODO: op=='m'
+        if op in {
+            'and', 'or', 'nand', 'nor', 'xor', 'xnor', # logical operators
+            'not',                                     # unary logical operators
+            '+', '-',                                  # addition operators (two operands)
+            '<', '<=', '=', '/=', '>', '>=',           # relational operators
+            '+', '-',                                  # unary operators (one operand)
+        }:
+            assert all(
+                isinstance(v.type, MigenInteger)
+                for v in expr.operands
+            ) # only Migen semantics are implemented
+            # VHDL and migen semantics match as long as the input types match
+            # and are either signed or unsigned
+            migen_repr = only_numeric.VHDL_representation_for(node.type)
+            expr.operands = [
+                TypeChange.if_needed(v,repr=migen_repr)
+                for v in
+                expr.operands
+            ]
+            return TypeChange.if_needed(node,repr=repr)
+        elif op in {'sll', 'srl', 'sla', 'sra', 'rol', 'ror'}:
+            # shift operators
+            raise NotImplementedError(type(self).__name__ + '.visit_Operator: operator ' + op)
+        elif op in {'&'}:
+            # concatenation operator (same precedence as addition operators)
+            raise NotImplementedError(type(self).__name__ + '.visit_Operator: operator ' + op)
+        elif op in {'*', '/', 'mod', 'rem'}:
+            # multiplying operators
+            raise NotImplementedError(type(self).__name__ + '.visit_Operator: operator ' + op)
+        elif op in {'**', 'abs'}:
+            # misc operators
+            raise NotImplementedError(type(self).__name__ + '.visit_Operator: operator ' + op)
+        else:
+            raise TypeError('Unknown operator "%s" with %d operands' % (node.op, len(node.operands)))
 
 
 class Converter:
@@ -823,6 +915,14 @@ class Converter:
         r.replaced_signals = replaced_signals
         r.converted = entity_body
 
+        # generate VHDL
+        src = VHDLPrinter().visit([
+            entity_body    # generates both the declaration and implementation of the entity
+        ])
+        r.set_main_source(
+            src
+        )
+
         return r
 
 Verilog2VHDL_operator_map = {v[0]:v[-1] for v in (v.split(':') for v in '''
@@ -835,32 +935,68 @@ Verilog2VHDL_operator_map = {v[0]:v[-1] for v in (v.split(':') for v in '''
 '''.split())}
 
 
-class VHDLExprPrinter(NodeTransformer):
-    def __init__(self,ns,signal_types,conversion_function):
-        self.ns = ns
-        self.signal_types = signal_types
-        self.conversion_function = conversion_function
+literal_printers = {
+    integer: lambda v, l: str(v),
+    unsigned: lambda v, l: '"' + bin(v)[2:].rjust(l, '0') + '"',
+    signed: lambda v, l: '"' + bin(v & ~-(1 << l))[2:].rjust(l, '0') + '"',
+    std_logic: lambda v, l: "'1'" if v else "'0'",
+    boolean: lambda v, l: "true" if v else "false",
+}
 
-    def _convert_type(self, type, expr, orig_type):
-        return self.conversion_function(type,expr,orig_type)
+def conv(template):
+    def convert(repr, expr, orig=None):
+        return template.format(
+            x=expr,
+            l=repr.indextypes[0].length if isinstance(repr, VHDLArray) else None,
+        )
+    return convert
+integer_repr_converters = {
+    (integer,std_logic):conv('to_integer(to_unsigned({x},1))'),   # '1', 'H' -> 1, else 0
+    (integer,signed):conv('to_integer({x})'),   # one-to-one
+    (integer,unsigned):conv('to_integer({x})'), # one-to-one
+    (signed,integer):conv('to_signed({x},{l})'), # ?
+    (unsigned,std_logic):conv('to_unsigned({x},{l})'),   # '1','H' -> 1, else -> 0
+    (unsigned,integer):conv('to_unsigned({x},{l})'),   # ?
+    (std_logic,boolean):conv("to_std_ulogic({x})"), # '1','H' -> true, else -> false
+    (integer,boolean):conv("to_integer(to_unsigned(to_std_ulogic({x}),1))"), # true -> '1', false -> '0'
+    (std_logic,integer):conv("get_index(to_unsigned({x},1),0)"), # truncates
+    (std_logic,unsigned):conv("get_index({x},0)"), # truncates
+#    (boolean,std_logic):conv("({x} = '1')"),
+    (boolean,integer):conv('({x} /= 0)'),
+    (boolean,unsigned):conv("(to_integer({x}) /= 0)"), # 0 -> false, else -> true
+}
 
-    def visit_as_type(self, node, type):
-        # check for type conversions
-        expr, orig_type = self.visit(node)
-        return self._convert_type(type,expr,orig_type)
 
+class VHDLPrinter(VHDLNodeTransformer):
+    def __init__(self):
+        # configuration (constants)
+
+        # global variables
+
+        # context variables
+        pass
+
+    @visitor_for_wrapped(Constant)
     def visit_Constant(self, node):
-        return str(node.value),integer.constrain(node.value,node.value)
+        printer = literal_printers[node.repr]
+        return printer(node.expr.value)
 
+    @visitor_for(TypeChange, needs_original_node=True)
+    def visit_TypeChange(self, orig, expr):
+        # TypeChange conversions are supposed to keep the represented value intact, thus they
+        # depend on the interpretation of the representation.
+        if not isinstance(orig.type, MigenInteger) or not isinstance(orig.expr.type, MigenInteger):
+            # so far, only conversions betwe
+            raise TypeError('Undefined (representation) conversion between types %s and %s' % (orig.expr.type, orig.type))
+        conv = integer_repr_converters.get((orig.repr.ultimate_base, orig.expr.repr.ultimate_base))
+        if conv is None:
+            raise TypeError('Unknown conversion between integer representations %s and %s' % (orig.expr.repr, orig.repr))
+        return conv(orig.repr, expr, orig.expr.repr)
+
+
+    @visitor_for_wrapped(Signal,ClockSignal,ResetSignal)
     def visit_Signal(self, node):
-        name = self.ns.get_name(node)
-        return name, self.signal_types[node]
-
-    def visit_ClockSignal(self, node):
-        return self.visit_Signal(node)
-
-    def visit_ResetSignal(self, node):
-        return self.visit_Signal(node)
+        raise TypeError("Bare MyHDL signals should be replaced with VHDLSignals first: "+str(node.expr))
 
     def visit_Operator(self, node):
         verilog_bits, verilog_signed = value_bits_sign(node)
@@ -984,35 +1120,6 @@ class _MapProxy(object):
         return self._getter(item)
 
 
-literal_printers = {
-    integer: lambda v, l: str(None),
-    unsigned: lambda v, l: '"' + bin(v)[2:].rjust(l, '0') + '"',
-    signed: lambda v, l: '"' + bin(v & ~-(1 << l))[2:].rjust(l, '0') + '"',
-    std_logic: lambda v, l: "'1'" if v else "'0'",
-}
-
-def conv(format):
-    def convert(type,expr,orig=None):
-        return format.format(
-            x=expr,
-            l=type.indextypes[0].length if isinstance(type,VHDLArray) else None,
-        )
-    return convert
-standard_type_conversions = {
-    (integer,std_logic):conv('to_integer(to_unsigned({x},1))'),   # '1', 'H' -> 1, else 0
-    (integer,signed):conv('to_integer({x})'),   # one-to-one
-    (integer,unsigned):conv('to_integer({x})'), # one-to-one
-    (signed,integer):conv('to_signed({x},{l})'), # ?
-    (unsigned,std_logic):conv('to_unsigned({x},{l})'),   # '1','H' -> 1, else -> 0
-    (unsigned,integer):conv('to_unsigned({x},{l})'),   # ?
-    (std_logic,boolean):conv("to_std_ulogic({x})"), # true -> '1', false -> '0'
-    (integer,boolean):conv("to_integer(to_unsigned(to_std_ulogic({x}),1))"), # true -> '1', false -> '0'
-    (std_logic,integer):conv("get_index(to_unsigned({x},1),0)"), # truncates
-    (std_logic,unsigned):conv("get_index({x},0)"), # truncates
-#    (boolean,std_logic):conv("({x} = '1')"),
-#    (boolean,integer):conv('({x} /= 0)'),
-#    (boolean,unsigned):conv("(to_integer({x}) /= 0)"), # 0 -> '0', else -> '1'
-}
 
 
 class Converter:
