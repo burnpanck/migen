@@ -94,7 +94,22 @@ class NodeTransformer(metaclass=WithRegisteredMethods):
     Particularly, the visitors are now only responsible to handle the node at hand, without doing the recursion.
     The recursion is done beforehand.
 
-    If you want to prevent recursion, overload the recursion functions instead.
+    When calling `visit(node)`, the following general structure is followed, where each function can be individually
+    replaced per node-type:
+    ```
+    visit(node){
+      ctx = context_for(node)
+      with ctx:
+        recursor_for(node){
+          for child in node:
+            visit(child)
+          return combiner_for(node)(node,visited_children)
+        }
+        apply visitor_for(node)
+    }
+    ```
+
+    If you want to prevent recursion, overload the recursion functions.
 
     Default methods always copy the node, except for:
     - Signals, ClockSignals and ResetSignals
@@ -129,7 +144,7 @@ class NodeTransformer(metaclass=WithRegisteredMethods):
     def contex_for_unknown_node(self, node):
         return {}
 
-    def recurse_unknown_node(self, node, ctxt):
+    def recurse_unknown_node(self, node):
         raise TypeError("Don't know how to recurse into children of nodes of type %s"%type(node))
 
     def combine_unknown_node(self, orig, *args, **kw):
@@ -169,58 +184,52 @@ class NodeTransformer(metaclass=WithRegisteredMethods):
                 raise RuntimeError('Could not revert context variables: '+str(fail))
 
     @recursor_for(Constant, Signal, ClockSignal, ResetSignal)
-    def recurse_Leaf(self, node, ctxt=None):
+    def recurse_Leaf(self, node):
         return node
     @combiner_for(Constant, Signal, ClockSignal, ResetSignal)
     def combine_Leaf(self, orig, *args, **kw):
         raise TypeError('Cannot rebuild leaf nodes')
 
     @recursor_for(_Operator)
-    def recurse_Operator(self, node, ctxt=None):
+    def recurse_Operator(self, node):
         assert all(isinstance(n,self.ExpressionNodes) for n in node.operands)
-        with self.subcontext(ctxt,node) as ctxt:
-            return self.combine(node, node.op, [self.visit(o, ctxt) for o in node.operands])
+        return self.combine(node, node.op, [self.visit(o) for o in node.operands])
 
     @recursor_for(_Slice)
-    def recurse_Slice(self, node, ctxt=None):
+    def recurse_Slice(self, node):
         assert isinstance(node.value,self.ExpressionNodes)
         assert isinstance(node.start,int)
         assert isinstance(node.stop,int)
-        with self.subcontext(ctxt,node) as ctxt:
-            return self.combine(node,self.visit(node.value,ctxt), node.start, node.stop)
+        return self.combine(node,self.visit(node.value), node.start, node.stop)
 
     @recursor_for(Cat)
-    def recurse_Cat(self, node, ctxt=None):
+    def recurse_Cat(self, node):
         assert all(isinstance(n,self.ExpressionNodes) for n in node.l)
-        with self.subcontext(ctxt,node) as ctxt:
-            return self.combine(node,*[self.visit(e,ctxt) for e in node.l])
+        return self.combine(node,*[self.visit(e) for e in node.l])
 
     @recursor_for(Replicate)
-    def recurse_Replicate(self, node, ctxt=None):
+    def recurse_Replicate(self, node):
         assert isinstance(node.v,self.ExpressionNodes)
         assert isinstance(node.n,int)
-        with self.subcontext(ctxt,node) as ctxt:
-            return self.combine(node,self.visit(node.v, ctxt), node.n)
+        return self.combine(node,self.visit(node.v), node.n)
 
     @recursor_for(_Assign)
-    def recurse_Assign(self, node, ctxt=None):
+    def recurse_Assign(self, node):
         assert isinstance(node.l,self.ExpressionNodes)
         assert isinstance(node.r,self.ExpressionNodes)
-        with self.subcontext(ctxt,node) as ctxt:
-            return self.combine(node,self.visit(node.l, ctxt), self.visit(node.r))
+        return self.combine(node,self.visit(node.l), self.visit(node.r))
 
     @recursor_for(If)
-    def recurse_If(self, node, ctxt=None):
+    def recurse_If(self, node):
         assert isinstance(node.cond,self.ExpressionNodes)
         assert isinstance(node.t,self.StatementNodes)
         assert isinstance(node.f,self.StatementNodes)
-        with self.subcontext(ctxt,node) as ctxt:
-            return self.combine(node,
-                cond = self.visit(node.cond, ctxt),
-                t = self.visit(node.t, ctxt),
-                f = self.visit(node.f, ctxt),
-            )
-        return r
+        return self.combine(node,
+            cond = self.visit(node.cond),
+            t = self.visit(node.t),
+            f = self.visit(node.f),
+        )
+
     @combiner_for(If)
     def combine_If(self,orig,cond,t,f):
         ret = type(orig)(cond)
@@ -229,24 +238,22 @@ class NodeTransformer(metaclass=WithRegisteredMethods):
         return ret
 
     @recursor_for(Case)
-    def recurse_Case(self, node, ctxt=None):
+    def recurse_Case(self, node):
         assert isinstance(node.test,self.ExpressionNodes)
         assert all(isinstance(n,self.ExpressionNodes) for n in node.cases.values())
-        with self.subcontext(ctxt,node) as ctxt:
-            cases = {v: self.visit(statements, ctxt)
-                     for v, statements in sorted(node.cases.items(),
-                                                 key=lambda x: str(x[0]))}
-            return self.combine(node,self.visit(node.test, ctxt), cases)
+        cases = {v: self.visit(statements)
+                 for v, statements in sorted(node.cases.items(),
+                                             key=lambda x: str(x[0]))}
+        return self.combine(node,self.visit(node.test), cases)
 
     @recursor_for(_Fragment)
-    def recurse_Fragment(self, node, ctxt=None):
+    def recurse_Fragment(self, node):
         assert isinstance(node.comb,self.StructuralNodes+self.StatementNodes)
         assert isinstance(node.sync,self.StructuralNodes+self.StatementNodes)
-        with self.subcontext(ctxt,node) as ctxt:
-            return self.combine(node,
-                comb = self.visit(node.comb, ctxt),
-                sync = self.visit(node.sync, ctxt),
-            )
+        return self.combine(node,
+            comb = self.visit(node.comb),
+            sync = self.visit(node.sync),
+        )
     @combiner_for(_Fragment)
     def combine_Fragment(self, orig, comb, sync):
         r = copy(orig)
@@ -256,29 +263,26 @@ class NodeTransformer(metaclass=WithRegisteredMethods):
 
     # NOTE: this will always return a list, even if node is a tuple
     @recursor_for(list, tuple)
-    def recurse_statements(self, node, ctxt=None):
+    def recurse_statements(self, node):
         assert all(isinstance(n,self.StatementNodes) for n in node)
-        with self.subcontext(ctxt,node) as ctxt:
-            return [self.visit(statement, ctxt) for statement in node]
+        return self.combine(node,[self.visit(statement) for statement in node])
 
     @recursor_for(dict)
-    def recurse_clock_domains(self, node, ctxt=None):
+    def recurse_clock_domains(self, node):
         assert all(isinstance(n,self.StatementNodes) for n in node.values())
-        with self.subcontext(ctxt,node) as ctxt:
-            return {
-                clockname: self.visit(statements, ctxt)
-                for clockname, statements in sorted(
-                    node.items(),
-                    key=itemgetter(0)
-                )
-            }
+        return self.combine({
+            clockname: self.visit(statements)
+            for clockname, statements in sorted(
+                node.items(),
+                key=itemgetter(0)
+            )
+        })
 
     @recursor_for(_ArrayProxy)
-    def recurse_ArrayProxy(self, node, ctxt=None):
+    def recurse_ArrayProxy(self, node):
         assert isinstance(node.key,self.ExpressionNodes)
         assert all(isinstance(n,self.ExpressionNodes) for n in node.choices)
-        with self.subcontext(ctxt,node) as ctxt:
-            return self.combine(node,
-                [self.visit(choice, ctxt) for choice in node.choices],
-                self.visit(node.key, ctxt)
-            )
+        return self.combine(node,
+            [self.visit(choice) for choice in node.choices],
+            self.visit(node.key)
+        )

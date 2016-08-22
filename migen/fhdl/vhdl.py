@@ -505,8 +505,8 @@ class TypeChange(AbstractTypedExpression):
     def __init__(self,expr,*,type=None,repr=None):
         assert isinstance(expr,AbstractTypedExpression)
         super().__init__(
-            type=type if type is not None else orig.type,
-            repr=repr if repr is not None else orig.repr,
+            type=type if type is not None else expr.type,
+            repr=repr if repr is not None else expr.repr,
         )
         self.expr = expr
 
@@ -526,6 +526,7 @@ class TestIfNonzero(TypeChange):
     """
     def __init__(self,expr,*,repr=None):
         super().__init__(
+            expr,
             type=MigenBool(),
             repr=repr
         )
@@ -537,6 +538,8 @@ class SelectedAssignment(_Assign):
     concurrent statements. Particularly, no case statements unless wrapped inside a process.
     However, selected assignments are specially designed assignments for this purpose.
     """
+    def __init__(self,*args,**kw):
+        raise NotImplementedError('SelectedAssignment')
 
 class ConditionalAssignment(_Assign):
     """ Essentially if-then-else with a built-in assignment to a single target.
@@ -569,13 +572,37 @@ def visitor_for_wrapped(*wrapped_node_types,needs_original_node=True):
         _needs_original_node=needs_original_node,
     )
 
+def combiner_for_wrapped(*wrapped_node_types):
+
+    """ Decorator to register a method to handle nodes wrapped within :py:class:`MigenExpression` nodes.
+
+    Any :py:class:`MigenExpression` node whose `expr` attribute matches any of the node classes given
+    as argument to this decorator will be handled by the decorated function.
+    """
+    return NodeTranformerGeneric.registering_decorator(
+        '_wrapped_node_combiners', wrapped_node_types,
+    )
+
 class VHDLNodeTransformer(NodeTranformerGeneric):
     """ Extends the NodeTransformer to handler VHDL nodes properly.
     """
     @recursor_for(MigenExpression)
     def recurse_Annotated(self,node):
-        return MigenExpression(self.visit(node.expr),node.type)
+        return self.combine(node,self.visit(node.expr),node.type)
 
+    @combiner_for(MigenExpression)
+    def combine_Annotated(self, orig, expr, type):
+        """ An annotated node. Delegates to the transform's registry based on the type of the wrapped expression."""
+        handler = type(self).find_handler(
+            '_wrapped_node_combiners',
+            orig.expr,
+            type(self).combine_unknown_wrapped_node
+        )
+        handler(self, orig, expr, type)
+
+
+    def combine_unknown_wrapped_node(self, orig, expr, type):
+        return type(orig)(expr,type)
 
     @visitor_for(MigenExpression, needs_original_node=True)
     def visit_Annotated(self, orig, node):
@@ -592,6 +619,30 @@ class VHDLNodeTransformer(NodeTranformerGeneric):
 
     def visit_unknown_wrapped_node(self,node):
         return node
+
+    @recursor_for(TypeChange)
+    def recurse_TypeChange(self,node):
+        return self.combine(node,self.visit(node.expr), type=node.type, repr=node.repr)
+    @combiner_for(TestIfNonzero)
+    def combine_TestIfNonzero(self,node,expr,*,type,repr):
+        assert type == MigenBool()
+        return type(node)(expr,repr=repr)
+
+    @recursor_for(ConditionalAssignment)
+    def recurse_ConditionalAssignment(self,node):
+        return self.combine(
+            node,
+            self.visit(node.l),
+            self.visit(node.default),
+            self.visit([
+                tuple(self.visit(v) for v in cv)
+                for cv in node.condition_value_pairs
+            ])
+        )
+
+    @recursor_for(SelectedAssignment)
+    def recurse_SelectedAssignment(self,node):
+        raise NotImplementedError('recurse_SelectedAssignment')
 
 # ---------------------------
 # Add explicit types to tree
@@ -803,8 +854,7 @@ class ToVHDLConverter(VHDLNodeTransformer):
     def visit_Operator(self, node):
         expr = node.expr
         repr = node.repr
-        verilog_bits, verilog_signed = value_bits_sign(expr)
-        op = Verilog2VHDL_operator_map[op]  # TODO: op=='m'
+        op = Verilog2VHDL_operator_map[expr.op]  # TODO: op=='m'
         if op in {
             'and', 'or', 'nand', 'nor', 'xor', 'xnor', # logical operators
             'not',                                     # unary logical operators
@@ -839,6 +889,13 @@ class ToVHDLConverter(VHDLNodeTransformer):
             raise NotImplementedError(type(self).__name__ + '.visit_Operator: operator ' + op)
         else:
             raise TypeError('Unknown operator "%s" with %d operands' % (node.op, len(node.operands)))
+
+    @visitor_for(TestIfNonzero)
+    def visit_TestIfNonzero(self,node):
+        node.expr = TypeChange.if_needed(node.expr,repr=integer)
+        repr = node.repr
+        node.repr = boolean
+        return TypeChange.if_needed(node,repr=repr)
 
 
 class Converter:
@@ -943,6 +1000,11 @@ literal_printers = {
     boolean: lambda v, l: "true" if v else "false",
 }
 
+# ---------------------------------
+# integer representation converters
+#
+# for all integers simultaneously representable in both representations
+# the conversion should be one to one. Otherwise the result is undefined.
 def conv(template):
     def convert(repr, expr, orig=None):
         return template.format(
@@ -981,25 +1043,37 @@ class VHDLPrinter(VHDLNodeTransformer):
         printer = literal_printers[node.repr]
         return printer(node.expr.value)
 
+    @combiner_for(TypeChange)
+    def combine_TypeChange(self, node, expr, *, type=None, repr=None):
+        return expr
+
     @visitor_for(TypeChange, needs_original_node=True)
     def visit_TypeChange(self, orig, expr):
         # TypeChange conversions are supposed to keep the represented value intact, thus they
         # depend on the interpretation of the representation.
         if not isinstance(orig.type, MigenInteger) or not isinstance(orig.expr.type, MigenInteger):
-            # so far, only conversions betwe
+            # so far, only conversions between MigenInteger is supported
             raise TypeError('Undefined (representation) conversion between types %s and %s' % (orig.expr.type, orig.type))
         conv = integer_repr_converters.get((orig.repr.ultimate_base, orig.expr.repr.ultimate_base))
         if conv is None:
             raise TypeError('Unknown conversion between integer representations %s and %s' % (orig.expr.repr, orig.repr))
         return conv(orig.repr, expr, orig.expr.repr)
 
+    @visitor_for(TestIfNonzero, needs_original_node=True)
+    def visit_TestIfNonzero(self, orig, expr):
+        if not (
+            (orig.expr.repr.ultimate_base == integer)
+            and (orig.repr == bool)
+        ):
+            raise TypeError('VHDL TestIfNonzero works only on integer and returns boolean')
+        return '('+expr + ' /= 0)'
 
     @visitor_for_wrapped(Signal,ClockSignal,ResetSignal)
     def visit_Signal(self, node):
         raise TypeError("Bare MyHDL signals should be replaced with VHDLSignals first: "+str(node.expr))
 
     def visit_Operator(self, node):
-        verilog_bits, verilog_signed = value_bits_sign(node)
+        migen_bits, migen_signed = value_bits_sign(node)
         op = Verilog2VHDL_operator_map[node.op]  # TODO: op=='m'
         if op in {'and','or','nand','nor','xor','xnor'}:
             # logical operators
@@ -1028,7 +1102,7 @@ class VHDLPrinter(VHDLNodeTransformer):
                 rex = self.visit_as_type(right,type)
             else:
                 # emulate Verilog semantics in VHDL
-                type = (signed if verilog_signed else unsigned)[verilog_bits-1:0]
+                type = (signed if migen_signed else unsigned)[migen_bits-1:0]
                 lex = self.visit_as_type(left,type)
                 rex = self.visit_as_type(right,type)
             return '('+lex + op + rex+')', type
@@ -1122,7 +1196,7 @@ class _MapProxy(object):
 
 
 
-class Converter:
+class ConverterOld:
     def typeof(self,sig):
         """ Calculate the VHDL type of a given expression/signal/variable. """
         if len(sig)==1:
