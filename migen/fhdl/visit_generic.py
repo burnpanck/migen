@@ -132,7 +132,7 @@ class NodeTransformer(metaclass=WithRegisteredMethods):
         context = type(self).find_handler('_node_context',node,type(self).context_for_unknown_node)(self,node)
         with self.subcontext(node,context):
             recursed = type(self).find_handler('_node_recursors',node,type(self).recurse_unknown_node)(self,node)
-            return self.visit_node(node,recursed)
+        return self.visit_node(node,recursed)
 
     def combine(self, orig, *args, **kw):
         combiner = type(self).find_handler('_node_combiners',orig,type(self).combine_unknown_node)
@@ -141,7 +141,7 @@ class NodeTransformer(metaclass=WithRegisteredMethods):
     def visit_unknown_node(self, node):
         return node
 
-    def contex_for_unknown_node(self, node):
+    def context_for_unknown_node(self, node):
         return {}
 
     def recurse_unknown_node(self, node):
