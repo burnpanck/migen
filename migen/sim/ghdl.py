@@ -3,8 +3,6 @@ import os, shutil
 import subprocess
 import re
 
-from .vcd import dump_VCD_events, VCD_events
-
 def generate_vcd(src_files, toplevel, stoptime=None, keep_files_on_fail=None):
     """ Simulate model *src_file* for time t in GHDL, and return the generated VCD. """
     def cmd(*args):

@@ -209,12 +209,6 @@ class NodeTransformer(NodeTranformerGeneric):
     the implicitly typed Migen nodes.
     """
 
-    @context_for(MigenExpression)
-    def MigenExpression_ctxt(self, node):
-        return dict(
-            type_annotation = node,
-        )
-
     @recursor_for(MigenExpression)
     def recurse_Annotated(self,node):
         handler = type(self).find_handler(

@@ -1,12 +1,22 @@
-Verilog2VHDL_operator_map = {v[0]:v[-1] for v in (v.split(':') for v in '''
- &:and |:or ^:xor
- < <= ==:= !=:/= > >=
- <<:sll >>:srl <<<:sla >>>:sra
- + -
- *
- ~:not
-'''.split())}
 
+
+from ..structure import (
+    Constant, Signal, ClockSignal, ResetSignal,
+    _Operator,
+    If,
+)
+from .explicit_migen_types import *
+from .type_annotator import ExplicitTyper
+from .types import *
+from .ast import (
+    Boolean,
+    TestIfNonzero,
+    VHDLSignal,
+    Component, ComponentInstance, Port,
+    Entity, EntityBody,
+    NodeTransformer,
+)
+from .syntax import Verilog2VHDL_operator_map
 
 literal_printers = {
     integer: lambda v, l: str(v),
@@ -20,7 +30,7 @@ literal_printers = {
 # integer representation converters
 #
 # for all integers simultaneously representable in both representations
-# the conversion should be one to one. Otherwise the result is undefined.
+# the conversion should be one to one. For other values the result is undefined.
 def conv(template):
     def convert(repr, expr, orig=None):
         return template.format(
@@ -45,7 +55,7 @@ integer_repr_converters = {
 }
 
 
-class VHDLPrinter(VHDLNodeTransformer):
+class VHDLPrinter(NodeTransformer):
     """ Write actual VHDL from an AST prepared with :py:class:`ToVHDLConverter`.
 
     Note that not all AST's are directly representable in VHDL.
@@ -64,11 +74,18 @@ class VHDLPrinter(VHDLNodeTransformer):
         pass
 
 
-    def recurse_unknown_wrapped_node(self,node):
-        # do not let self.visit for the wrapped node try to re-assemble a node
-        # instead, simply jump over
-        return self.visit(node.expr)
+    def combine(self, orig, *args, **kw):
+        if len(self.ancestry)>1 and isinstance(self.ancestry[-2],MigenExpression):
+            # direct child of a type wrapper: replace combine call by
+            wrapnode = self.ancestry[-2]
+            combiner = type(self).find_handler('_wrapped_node_combiners',orig,type(self).combine_unknown_wrapped_node)
+            return combiner(wrapnode, *args, **kw)
+        combiner = type(self).find_handler('_node_combiners',orig,type(self).combine_unknown_node)
+        return combiner(orig, *args, **kw)
 
+    def recurse_unknown_wrapped_node(self,node):
+        # TODO: what to do here?
+        return self.visit(node.expr)
 
     @visitor_for_wrapped(Constant)
     def visit_Constant(self, node):
@@ -79,17 +96,32 @@ class VHDLPrinter(VHDLNodeTransformer):
     def combine_TypeChange(self, node, expr, *, type=None, repr=None):
         return expr
 
-    @visitor_for(TypeChange, needs_original_node=True)
-    def visit_TypeChange(self, orig, expr):
+    @combiner_for(TypeChange)
+    def visit_TypeChange(self, orig, expr, *, type=None, repr=None):
+        ntype = orig.type if type is None else type
+        nrepr = orig.repr if repr is None else repr
+        otype = orig.expr.type
+        orepr = orig.expr.repr
+
         # TypeChange conversions are supposed to keep the represented value intact, thus they
         # depend on the interpretation of the representation.
-        if not isinstance(orig.type, MigenInteger) or not isinstance(orig.expr.type, MigenInteger):
+        if not isinstance(ntype, MigenInteger) or not isinstance(otype, MigenInteger):
             # so far, only conversions between MigenInteger is supported
-            raise TypeError('Undefined (representation) conversion between types %s and %s' % (orig.expr.type, orig.type))
-        conv = integer_repr_converters.get((orig.repr.ultimate_base, orig.expr.repr.ultimate_base))
-        if conv is None:
-            raise TypeError('Unknown conversion between integer representations %s and %s' % (orig.expr.repr, orig.repr))
-        return conv(orig.repr, expr, orig.expr.repr)
+            raise TypeError('Undefined (representation) conversion between types %s and %s' % (otype, ntype))
+        conv = integer_repr_converters.get((nrepr.ultimate_base, orepr.ultimate_base))
+        if conv is not None:
+            return conv(nrepr, expr, orepr)
+        if not isinstance(orepr,VHDLArray) or not isinstance(nrepr,VHDLArray):
+            raise TypeError('Unknown conversion between integer representations %s and %s' % (orepr, nrepr))
+        if not nrepr.ulimate_base == orepr.ultimate_base:
+            raise TypeError('Unknown conversion between integer representations %s and %s' % (orepr, nrepr))
+        # simply assume the presence of a resize function
+        expr = 'resize('+expr+','+str(type.indextypes[0].length)+')'
+        if not orepr.valuetype.compatible_with(type.valuetype):
+            assert orepr.castable_to(type.valuetype)
+            assert type.name is not None
+            expr = type.name+'('+expr+')'
+        return expr
 
     @visitor_for(TestIfNonzero, needs_original_node=True)
     def visit_TestIfNonzero(self, orig, expr):
@@ -102,64 +134,73 @@ class VHDLPrinter(VHDLNodeTransformer):
 
     @visitor_for_wrapped(Signal,ClockSignal,ResetSignal)
     def visit_Signal(self, node):
-        raise TypeError("Bare MyHDL signals should be replaced with VHDLSignals first: "+str(node.expr))
+        raise TypeError("Bare Migen signals should be replaced with VHDLSignals first: "+str(node.expr))
+
+    @visitor_for(Port)
+    def visit_Port(self, node):
+        raise NotImplementedError
+
+    def _format_signal_decl(self, sig, initialise=False):
+        ret = sig.name + ': ' + sig.repr.vhdl_repr
+        if initialise:
+            ret += ' := ' + self.visit(sig.reset)
+        return ret
+
+    @recursor_for(Component)
+    def recurse_Component(self, node):
+        # TODO: generic
+        return (
+            "component {name}\n"
+            "\tport ({ports});"
+            "end component;\n"
+        ).format(
+            name=node.name,
+            ports=','.join('\n\t\t' + self.visit(p) for p in node.ports) + ('\n\t' if node.ports else '')
+        )
+
+    @recursor_for(ComponentInstance)
+    def recurse_ComponentInstance(self, node):
+        # TODO: generic map
+        return "{instname}: {componentname} port map ({ports});".format(
+            instname=node.name,
+            componentname=node.component.name,
+            ports=','.join('\n\t{port} => {signal}' + self.visit() for k,v in node.portmap.items()) + ('\n' if node.ports else '')
+        )
+
+    @recursor_for(EntityBody)
+    def recurse_EntityBody(self, node):
+        header = "architecture {arch} of {entity}\n".format(
+            arch = node.architecture,
+            entity = node.entity.name,
+        )
+        for com in sorted(self.instances.values(),key=lambda c:c.name):
+            header += self.visit(com)+'\n'
+
+        for sig in node.signals:
+            header += '\t'+self._format_signal_decl(sig,True)+';\n'
+
+        ret = header + 'begin\n'
+        for stmt in self.statements:
+            ret += self.visit(stmt)
+        ret += 'end\n'
+        return ret
+
+    @visitor_for(VHDLSignal)
+    def visit_VHDLSignal(self, node):
+
+        return node.name
 
     @combiner_for_wrapped(_Operator)
     def combine_Operator(self, wrapnode, op, operands):
         node = wrapnode.expr
-
-
-        migen_bits, migen_signed = value_bits_sign(node)
         op = Verilog2VHDL_operator_map[op]  # TODO: op=='m'
-        if op in {'and','or','nand','nor','xor','xnor'}:
-            # logical operators
-            left,right = operands
-            lex,type = self.visit(left)
-            rex = self.visit_as_type(right,type)
-            return '('+lex + ' ' + op + ' ' + rex+')', type
-        elif op in {'<','<=','=','/=','>','>='}:
-            # relational operators
-            left,right = node.operands
-            lex,type = self.visit(left)
-            rex = self.visit_as_type(right,type)
-            return '('+lex + op + rex+')', boolean
-        elif op in {'sll','srl','sla','sra','rol','ror'}:
-            # shift operators
-            left,right = node.operands
-            lex,type = self.visit(left)
-            rex = self.visit_as_type(right,integer)
-            return '('+lex + ' ' + op + ' ' + rex+')', type
-        elif op in {'+','-'} and len(node.operands)==2:
-            # addition operators
-            left,right = node.operands
-            if False:
-                # VHDL semantics
-                lex,type = self.visit(left)
-                rex = self.visit_as_type(right,type)
-            else:
-                # emulate Verilog semantics in VHDL
-                type = (signed if migen_signed else unsigned)[migen_bits-1:0]
-                lex = self.visit_as_type(left,type)
-                rex = self.visit_as_type(right,type)
-            return '('+lex + op + rex+')', type
-        elif op in {'&'}:
-            # concatenation operator (same precedence as addition operators)
-            raise NotImplementedError(type(self).__name__ + '.visit_Operator: operator '+op)
-        elif op in {'+','-'} and len(node.operands)==1:
+        if len(operands) == 2:
+            left, right = operands
+            return '('+left + ' ' + op + ' ' + right+')'
+        elif len(operands) == 1:
             # unary operators
-            right, = node.operands
-            ex,type = self.visit(right)
-            return '(' + op + ex+')', type
-        elif op in {'*','/','mod','rem'}:
-            # multiplying operators
-            raise NotImplementedError(type(self).__name__ + '.visit_Operator: operator '+op)
-        elif op in {'not'}:
-            right, = node.operands
-            ex,type = self.visit(right)
-            return '(' + op + ' ' + ex+')', type
-        elif op in {'**','abs'}:
-            # misc operators
-            raise NotImplementedError(type(self).__name__ + '.visit_Operator: operator '+op)
+            right, = operands
+            return '(' + op + right + ')'
         else:
             raise TypeError('Unknown operator "%s" with %d operands'%(node.op,len(node.operands)))
 
@@ -199,6 +240,42 @@ class VHDLPrinter(VHDLNodeTransformer):
     def visit_If(self, node):
         return self._cannot_visit(node)
 
+    def _printnode(self, ns, level, node):
+        if isinstance(node, _Assign):
+            assignment = " <= "
+            assert isinstance(node.l,(Signal,_Slice))
+            left,leftt = self._printexpr(ns,node.l,type=True)
+            return "\t" * level + left + assignment + self._printexpr(ns, node.r, type=leftt) + ";\n"
+        elif isinstance(node, collections.Iterable):
+            return "".join(self._printnode(ns, level, n) for n in node)
+        elif isinstance(node, If):
+            r = "\t" * level + "if " + self._printexpr(ns, node.cond, integer) + "/=0 then\n"
+            r += self._printnode(ns, level + 1, node.t)
+            if node.f:
+                r += "\t" * level + "else\n"
+                r += self._printnode(ns, level + 1, node.f)
+            r += "\t" * level + "end if;\n"
+            return r
+        elif isinstance(node, Case):
+            if node.cases:
+                test,testt = self._printexpr(ns, node.test, type=True)
+
+                r = "\t" * level + "case " + test + " is \n"
+                css = [(k, v) for k, v in node.cases.items() if isinstance(k, Constant)]
+                css = sorted(css, key=lambda x: x[0].value)
+                for choice, statements in css:
+                    r += "\t" * (level + 1) + "when " + self._printliteral(choice, testt) + " =>\n"
+                    r += self._printnode(ns, level + 2, statements)
+                if "default" in node.cases:
+                    r += "\t" * (level + 1) + "when others => \n"
+                    r += self._printnode(ns, level + 2, node.cases["default"])
+                r += "\t" * level + "end case;\n"
+                return r
+            else:
+                return ""
+        else:
+            raise TypeError("Node of unrecognized type: " + str(type(node)))
+
     def visit_Case(self, node):
         return self._cannot_visit(node)
 
@@ -221,3 +298,113 @@ class VHDLPrinter(VHDLNodeTransformer):
 
     def _cannot_visit(self, node):
         raise TypeError('Node of type "%s" cannot be written as a VHDL expression'%type(node).__name__)
+
+    def _printuse(self, extra=[]):
+        r = """
+library ieee;
+use ieee.std_logic_1164.all;
+use ieee.numeric_std.all;
+use work.migen_helpers.all;
+"""
+        for u in extra:
+            r += 'use ' + u + ';\n'
+        return r
+
+    def _printentitydecl(self, f, ios, name, ns,
+                         reg_initialization):
+        sigs = list_signals(f) | list_special_ios(f, True, True, True)
+        special_outs = list_special_ios(f, False, True, True)
+        inouts = list_special_ios(f, False, False, True)
+        targets = list_targets(f) | special_outs
+        r = """
+entity {name} is
+\tport(
+""".format(name=name)
+        r += ';\n'.join(
+            '\t' * 2 + self._printsig(ns, sig, 'inout' if sig in inouts else 'buffer' if sig in targets else 'in',
+                                      initialise=True)
+            for sig in sorted(ios, key=lambda x: x.duid)
+        )
+        r += """\n);
+end {name};
+    """.format(name=name)
+        return r
+
+    def _printarchitectureheader(self, f, ios, name, ns,
+                                 reg_initialization, extra=""):
+        sigs = list_signals(f) | list_special_ios(f, True, True, True)
+        special_outs = list_special_ios(f, False, True, True)
+        inouts = list_special_ios(f, False, False, True)
+        targets = list_targets(f) | special_outs
+        r = """
+    architecture Migen of {name} is
+    """.format(name=name)
+        r += '\n'.join(
+            ' ' * 4 + 'signal ' + self._printsig(ns, sig, '', initialise=True) + ';'
+            for sig in sorted(sigs - ios, key=lambda x: x.duid)
+        ) + '\n'
+        r += extra
+        r += "begin\n"
+        return r
+
+    def _printsync(self, f, name, ns):
+        r = ""
+        for k, v in sorted(f.sync.items(), key=itemgetter(0)):
+            clk = ns.get_name(f.clock_domains[k].clk)
+            r += name + '_' + k + ": process ({clk})\nbegin\nif rising_edge({clk}) then\n".format(clk=clk)
+            r += self._printnode(ns, 1, v)
+            r += "end if;end process;\n\n"
+        return r
+
+    def _printcomb(self, f, ns):
+        if not f.comb:
+            return '\n'
+
+        r = ""
+        groups = group_by_targets(f.comb)
+
+        def extract_assignment(target, node, type, reset, precondition=None):
+            if isinstance(node, _Assign):
+                if node.l is target:
+                    return self._printexpr(ns, node.r, type)
+                return None
+            if isinstance(node, If):
+                condition = self._printexpr(ns, node.cond, integer) + '/=0'
+                if precondition:
+                    condition = '(' + precondition + ' and ' + condition + ')'
+                return (
+                    extract_assignment(target, node.t, type, reset, condition)
+                    + " when " + condition + " else "
+                    + (extract_assignment(target, node.f, type, reset) if node.f else reset)
+                )
+            if isinstance(node, (list, tuple)):
+                values = list(filter(None, [extract_assignment(target, n, type, reset) for n in node]))
+                if len(values) > 1:
+                    raise TypeError('More than one assignment to ' + str(target))
+                if not values:
+                    return reset
+                return values[0]
+            raise TypeError(
+                'Combinatorial statements may only contain _Assign or If:\n' + format_tree(node, prefix='> '))
+
+        for n, (target, statements) in enumerate(groups):
+            for t in target:
+                type = self.typeof(t)
+                reset = self._printexpr(ns, t.reset, type)
+                r += "\t" + ns.get_name(t) + " <= " + extract_assignment(t, statements, type, reset) + ";\n"
+        r += "\n"
+        return r
+
+
+def _printspecials(self, overrides, specials, ns, add_data_file):
+    use = []
+    decl = ""
+    body = ""
+    for special in sorted(specials, key=lambda x: x.duid):
+        pr = call_special_classmethod(overrides, special, "emit_vhdl", self, ns, add_data_file)
+        if pr is None:
+            raise NotImplementedError("Special " + str(special) + " failed to implement emit_vhdl")
+        use.extend(pr.get('use', []))
+        decl += pr.get('decl', '')
+        body += pr.get('body', '')
+    return dict(use=use, decl=decl, body=body)

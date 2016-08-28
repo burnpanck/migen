@@ -16,11 +16,14 @@ In Migen, we therefore add two levels of explicit typing:
 - :py:modl:`.types` contains tools to represent and manipulate VHDL types (i.e. VHDL specific representations of Migen values).
 - :py:modl:`.type_annotator` supplies :py:class:`.type_annotator.ExplicitTyper`, a node transfomrmer that adds
  explicit semantic types to a Migen AST without explicit such information.
-- :py:modl:`.converter` contains a node transformer that transforms a Migen AST into an AST closely matching
+- :py:modl:`.lowerer` contains a node transformer that transforms a Migen AST into an AST closely matching
  a VHDL ast, including annotation of actual representations.
 - :py:modl:`.writer` generates VHDL code from suitable ASTs.
-
+- :py:modl:`.converter` wraps everything into a single easy to use interface
 
 TODO:
  - Refactor integer ranges for consistency (appears in Migen slices, semantic migen types and VHDL types)
 """
+
+
+from .converter import Converter, generate_testbench

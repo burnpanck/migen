@@ -44,7 +44,7 @@ class SimCase:
             # VHDL simulation
             tb = testbench_class()
             out = vhdl.convert(tb)
-            out.main_source += vhdl.Converter().generate_testbench(out,clocks=clocks)
+            out.main_source += vhdl.generate_testbench(out,clocks=clocks)
             vhdlfile = os.path.join(dir,'testbench.vhd')
             out.write(vhdlfile)
             print(out)

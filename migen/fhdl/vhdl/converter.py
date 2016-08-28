@@ -1,165 +1,235 @@
+from functools import partial
+from operator import itemgetter
+import abc, itertools
+import collections
+import abc
 
-from ..structure import (
-    Signal, ClockSignal, ResetSignal,
-    _Operator,
+from migen.fhdl.structure import *
+from migen.fhdl.structure import _Operator, _Slice, _Assign, _Fragment, _Value, _Statement, _ArrayProxy
+from migen.fhdl.tools import *
+from migen.fhdl.visit import NodeTransformer
+from migen.fhdl.visit_generic import (
+    NodeTransformer as NodeTranformerGeneric,
+    visitor_for, recursor_for, context_for, combiner_for,
 )
-from .explicit_migen_types import *
-from .type_annotator import ExplicitTyper
-from .types import *
-from .ast import (
-    Boolean,
-    TestIfNonzero,
-    VHDLSignal,
-    EntityBody,
-    NodeTransformer,
-)
+from migen.fhdl.namer import build_namespace
+from migen.fhdl.conv_output import ConvOutput
+from migen.fhdl.bitcontainer import value_bits_sign
 
-class VHDLReprGenerator:
-    def __init__(self,overrides={},*,single_bit=std_logic,unsigned=unsigned,signed=signed,boolean=boolean):
-        self.overrides = overrides
-        self.boolean = boolean
-        self.single_bit = single_bit
-        self.unsigned = unsigned
-        self.signed = signed
-        self.typer = ExplicitTyper(raise_on_type_mismatch=True)
 
-    def VHDL_representation_of_Signal(self,signal):
-        if not isinstance(signal,AbstractTypedExpression):
-            signal = self.typer.visit(signal)
-#        assert isinstance(signal,)
-        migen_type = signal.type
-        return migen_type, self.VHDL_representation_for(migen_type)
+class Converter:
+    def __init__(self,*,io_repr=all_slv,create_clock_domains=True,special_overrides={}):
+        self.io_repr = io_repr
+        self.create_clock_domains = create_clock_domains
+        self.special_overrides = special_overrides
 
-    def VHDL_representation_for(self, migen_type):
-        """ Given a migen type, find a suitable VHDL representation.
+    def convert(self,f,ios,name='top'):
+        r = ConvOutput()
+        if not isinstance(f, _Fragment):
+            f = f.get_fragment()
+        if ios is None:
+            ios = set()
+        r.fragment = f
+        r.name = name
 
-        If argument already has a specified VHDL representation, returns that one.
-        """
-        assert isinstance(migen_type,MigenExpressionType)
-        if isinstance(migen_type,Boolean):
-            return self.boolean
-        if not isinstance(migen_type,MigenInteger):
-            raise TypeError("Don't know how to map type %s to VHDL"%migen_type)
-        if isinstance(migen_type, Unsigned) and migen_type.nbits == 1:
-            # Verilog has no boolean type, so is this a 1-element array or a single wire?
-            if self.single_bit is not None:
-                return self.single_bit
-        typ = self.signed if isinstance(migen_type, Signed) else self.unsigned
-        return typ[migen_type.nbits-1:0]
+        for cd_name in sorted(list_clock_domains(f)):
+            try:
+                f.clock_domains[cd_name]
+            except KeyError:
+                if self.create_clock_domains:
+                    cd = ClockDomain(cd_name)
+                    f.clock_domains.append(cd)
+                    ios |= {cd.clk, cd.rst}
+                else:
+                    raise KeyError("Unresolved clock domain: '" + cd_name + "'")
 
-natural_repr = VHDLReprGenerator(single_bit=std_logic,unsigned=unsigned,signed=signed,boolean=boolean)
-only_numeric = VHDLReprGenerator(single_bit=None,unsigned=unsigned,signed=signed,boolean=unsigned[0:0])
-all_slv = VHDLReprGenerator(single_bit=std_logic,unsigned=std_logic_vector,signed=std_logic_vector,boolean=std_logic)
 
-class ToVHDLConverter(NodeTransformer):
-    """ Converts a Migen AST into an AST suitable for VHDL export
+        f = lower_complex_slices(f)
+        insert_resets(f)
+        f = lower_basics(f)
+        fs, lowered_specials = lower_specials(self.special_overrides, f.specials)
+        f += lower_basics(fs)
 
-    In this process, it assigns a suitable VHDL type to any expression.
+        # add explicit typing information
+        f = ExplicitTyper().visit(f)
+
+        r.lowered_fragment = f
+
+        # generate outer structure
+        ns = build_namespace(list_signals(f) \
+                             | list_special_ios(f, True, True, True) \
+                             | ios, _reserved_keywords)
+        ns.clock_domains = f.clock_domains
+        r.ns = ns
+
+        # TODO: should the following wrapping be done in ToVHDLLowerer?
+        ports = []
+        replaced_signals = {}
+        for io in sorted(ios, key=lambda x: x.duid):
+            if io.name_override is None:
+                io_name = io.backtrace[-1][0]
+                if io_name:
+                    io.name_override = io_name
+            typ, rep = self.io_repr.VHDL_representation_for(io)
+            p = Port(
+                name = ns.get_name(io),
+                dir = 'out' if io in outputs else 'in',
+                type = typ,
+                repr = rep,
+            )
+            replaced_signals[io] = p
+            ports.append(p)
+        r.ios = ios
+
+        entity = Entity(name=name,ports=ports)
+        entity_body = EntityBody(entity=entity,statements=[f])
+
+        # convert body
+        entity_body = ToVHDLLowerer(
+            vhdl_repr=self.vhdl_repr,
+            replaced_signals=replaced_signals,
+        ).visit(entity_body)
+        r.replaced_signals = replaced_signals
+        r.converted = entity_body
+
+        # generate VHDL
+        src = '-- Machine generated using Migen'
+        src += VHDLPrinter().visit([
+            entity_body    # generates both the declaration and implementation of the entity
+        ])
+        r.set_main_source(
+            src
+        )
+
+        return r
+
+
+
+    def convert(self, f, ios=None, name="top",
+        special_overrides=dict(),
+        create_clock_domains=True,
+        asic_syntax=False
+    ):
+        r = ConvOutput()
+        if not isinstance(f, _Fragment):
+            f = f.get_fragment()
+        if ios is None:
+            ios = set()
+        r.fragment = f
+        r.name = name
+
+        for cd_name in sorted(list_clock_domains(f)):
+            try:
+                f.clock_domains[cd_name]
+            except KeyError:
+                if create_clock_domains:
+                    cd = ClockDomain(cd_name)
+                    f.clock_domains.append(cd)
+                    ios |= {cd.clk, cd.rst}
+                else:
+                    raise KeyError("Unresolved clock domain: '"+cd_name+"'")
+
+        r.ios = ios
+
+        f = lower_complex_slices(f)
+        insert_resets(f)
+        f = lower_basics(f)
+        fs, lowered_specials = lower_specials(special_overrides, f.specials)
+        f += lower_basics(fs)
+
+        r.lowered_fragment = f
+
+        for io in sorted(ios, key=lambda x: x.duid):
+            if io.name_override is None:
+                io_name = io.backtrace[-1][0]
+                if io_name:
+                    io.name_override = io_name
+        ns = build_namespace(list_signals(f) \
+                             | list_special_ios(f, True, True, True) \
+                             | ios, _reserved_keywords)
+        ns.clock_domains = f.clock_domains
+        r.ns = ns
+
+        specials = self._printspecials(special_overrides, f.specials - lowered_specials, ns, r.add_data_file)
+
+
+        src = "-- Machine-generated using Migen\n"
+        src += self._printuse(extra=specials['use'])
+        src += self._printentitydecl(f, ios, name, ns, reg_initialization=not asic_syntax)
+        src += self._printarchitectureheader(f, ios, name, ns, reg_initialization=not asic_syntax, extra=specials['decl'])
+        src += self._printcomb(f, ns)
+        src += self._printsync(f, name, ns)
+        src += specials['body']
+        src += "end Migen;\n"
+        r.set_main_source(src)
+
+        return r
+
+def generate_testbench(self, code, clocks={'sys':10}):
+    """ Genertes a testbench that does nothing but instantiate the DUT and run it's clocks.
+
+    The testbench does not generate any reset signals.
+
+    You must supply the result of a previous conversion.
     """
+    from ...sim.core import TimeManager
 
-    def __init__(self,*,vhdl_repr=natural_repr,replaced_signals={}):
-        # configuration (constants)
-        self.vhdl_repr = vhdl_repr
+    name = code.name
+    ns = code.ns
+    f = code.lowered_fragment
+    ios = code.ios
 
-        # global variables
-        self.replaced_signals = replaced_signals
+    tbname = name + '_testbench'
 
-        # context variables
-        self.entity = None  # the entity body we're currently building
+    sigs = list_signals(f) | list_special_ios(f, True, True, True)
+    special_outs = list_special_ios(f, False, True, True)
+    inouts = list_special_ios(f, False, False, True)
+    targets = list_targets(f) | special_outs
 
-    @context_for(EntityBody)
-    def EntityBody_ctxt(self, node):
-        return dict(
-            entity = node,
+    time = TimeManager(clocks)
+
+    sortedios = sorted(ios, key=lambda x: x.duid)
+    src = """
+library ieee;
+use ieee.std_logic_1164.all;
+use ieee.numeric_std.all;
+use work.migen_helpers.all;
+
+entity {name} is begin end {name};
+
+architecture Migen of {name} is
+component {dut}
+\tport({dutport});
+end component;
+{signaldecl}
+begin
+dut: {dut} port map ({portmap});
+""".format(
+        name=tbname,
+        dut=name,
+        dutport=';\n\t\t'.join(
+            self._printsig(ns, sig, 'inout' if sig in inouts else 'buffer' if sig in targets else 'in', initialise=False)
+            for sig in sortedios
+        ),
+        signaldecl=''.join(
+            'signal ' + self._printsig(ns, sig, '', initialise=True) + ';\n'
+            for sig in sortedios
+        ),
+        portmap=', '.join(ns.get_name(s) for s in sortedios),
+    )
+
+    for k in sorted(list_clock_domains(f)):
+        clk = time.clocks[k]
+        src += """clk_gen({name}_clk, {dt} ns, {advance} ns, {initial});\n""".format(
+            name=k,
+            dt=clk.half_period,
+            advance=clk.half_period - clk.time_before_trans,
+            initial="'1'" if clk.high else "'0'",
         )
 
-    def assign_VHDL_repr(self, node):
-        if node.repr is None:
-            node.repr = self.vhdl_repr.VHDL_representation_for(node.type)
+    src += 'end;\n'
 
-    @visitor_for(AbstractTypedExpression)
-    def visit_Typed(self, node):
-        self.assign_VHDL_repr(node)
-        return node
+    return src
 
-    @visitor_for(MigenExpression,needs_original_node=True)
-    def visit_Annotated(self, orig, node):
-        # nested nodes have already been processed, now generate an appropriate VHDL type for this node
-        self.assign_VHDL_repr(node)
-        # now delegate to visitors
-        return super().visit_Annotated(orig,node)
-
-    @visitor_for_wrapped(Signal, ClockSignal, ResetSignal)
-    def wrapped_Signal(self, node):
-        sig = node.expr
-        repl = self.replaced_signals.get(sig,None)
-        if repl is not None:
-            # this Signal already has a replacement.
-            # TODO: should we again check if the type in this wrapper conforms to the replacement signal?
-            return repl
-        # this Signal does not yet have a replacement.
-        ret = VHDLSignal(
-            name = self.ns.get_name(sig),
-            type = node.type,
-            repr = self.vhdl_repr.VHDL_representation_for(node.type),
-        )
-        # add to replacement map
-        self.replaced_signals[sig] = ret
-        # add signal to entity
-        assert not ret.name in self.entity.ports
-        assert not ret.name in self.entity.signals
-        self.entity.signals[ret.name] = ret
-        return ret
-
-    @visitor_for_wrapped(_Operator)
-    def visit_Operator(self, node):
-        expr = node.expr
-        repr = node.repr
-        op = Verilog2VHDL_operator_map[expr.op]  # TODO: op=='m'
-        if op in {
-            'and', 'or', 'nand', 'nor', 'xor', 'xnor', # logical operators
-            'not',                                     # unary logical operators
-            '+', '-',                                  # addition operators (two operands)
-            '<', '<=', '=', '/=', '>', '>=',           # relational operators
-            '+', '-',                                  # unary operators (one operand)
-        }:
-            assert all(
-                isinstance(v.type, MigenInteger)
-                for v in expr.operands
-            ) # only Migen semantics are implemented
-            # VHDL and migen semantics match as long as the input types match
-            # and are either signed or unsigned
-            migen_repr = only_numeric.VHDL_representation_for(node.type)
-            expr.operands = [
-                TypeChange.if_needed(v,repr=migen_repr)
-                for v in
-                expr.operands
-            ]
-            return TypeChange.if_needed(node,repr=repr)
-        elif op in {'sll', 'srl', 'sla', 'sra', 'rol', 'ror'}:
-            # shift operators
-            raise NotImplementedError(type(self).__name__ + '.visit_Operator: operator ' + op)
-        elif op in {'&'}:
-            # concatenation operator (same precedence as addition operators)
-            raise NotImplementedError(type(self).__name__ + '.visit_Operator: operator ' + op)
-        elif op in {'*', '/', 'mod', 'rem'}:
-            # multiplying operators
-            raise NotImplementedError(type(self).__name__ + '.visit_Operator: operator ' + op)
-        elif op in {'**', 'abs'}:
-            # misc operators
-            raise NotImplementedError(type(self).__name__ + '.visit_Operator: operator ' + op)
-        else:
-            raise TypeError('Unknown operator "%s" with %d operands' % (node.op, len(node.operands)))
-
-    @visitor_for(If)
-    def visit_If(self, node):
-        # make implicit test explicit
-        node.cond = TestIfNonzero(node.cond)
-        return node
-
-    @visitor_for(TestIfNonzero)
-    def visit_TestIfNonzero(self,node):
-        node.expr = TypeChange.if_needed(node.expr,repr=integer)
-        repr = node.repr
-        node.repr = boolean
-        return TypeChange.if_needed(node,repr=repr)
+def convert(f, ios=None, name="top", special_overrides={}, create_clock_domains=True, asic_syntax=False):
+    return Converter().convert(f,ios,name,special_overrides,create_clock_domains,asic_syntax)

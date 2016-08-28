@@ -8,7 +8,7 @@ from ..structure import _Statement, _Assign, _Value
 from ..visit_generic import recursor_for, combiner_for, visitor_for
 from .explicit_migen_types import AbstractExpressionType, AbstractTypedExpression, TypeChange
 from .explicit_migen_types import NodeTransformer as ExplicitlyTypedNodeTransformer
-
+from .syntax import reserved_keywords
 # ----------------------------------------------------------------------------
 # Additional semantic types not part of Migen's front-end, but needed for VHDL
 # ----------------------------------------------------------------------------
@@ -75,7 +75,6 @@ class Port(VHDLSignal):
         VHDLSignal.__init__(name,type,repr)
         self.dir = dir
 
-
 class Scope(abc.ABC):
     """ Mixin class for AST nodes that form a scope or namespace. """
     def get_object(self,name):
@@ -98,7 +97,7 @@ class DictScope(dict,Scope):
 
 ReservedKeyword = ()    # Singleton indicating that a name is a reserved keyword
 ReservedKeywords = DictScope({
-    k:ReservedKeyword for k in _reserved_keywords
+    k:ReservedKeyword for k in reserved_keywords
 })
 
 class Entity(Scope):
@@ -108,6 +107,7 @@ class Entity(Scope):
         self.ports = ports
 
 class Component:
+    # TODO: generics
     def __init__(self,name,entity,**kw):
         assert not kw
         assert isinstance(entity,Entity)
@@ -122,28 +122,31 @@ class ComponentInstance(_Statement):
     def __init__(self,name,component,portmap={},*kw):
         assert not kw
         assert isinstance(component,Component)
+        assert all(isinstance(v,(Signal,VHDLSignal)) for k,v in portmap.items())
         self.name = name
         self.component = component
         self.portmap = portmap
 
 class EntityBody(Scope):
-    def __init__(self,entity,*,statements=[],architecture='Migen',signals={},instances={},namespace={}):
+    def __init__(self,entity,*,statements=[],architecture='Migen',signals={},components={},namespace={}):
         """
         :param entity: The entity which is implemented in this body
         :param architecture: The architecture name
         :param signals: The local signals (ports are defined on `entity`)
-        :param instances: Instantiations of components
+        :param components: Declarations of components
         :param namespace: Mapping of all names to their meaning inside the body.
-        :param statements: The (concurrent) statements (including processes) contained in the body.
+        :param statements: The (concurrent) statements (including processes and component instantiations) contained in the body.
         """
         assert isinstance(entity,Entity)
         assert all(isinstance(s,VHDLSignal) for s in signals.values())
-        assert all(isinstance(i,ComponentInstance) for i in instances.values())
+        if not isinstance(components, dict):
+            components = {c.name:c for c in components}
+        assert all(isinstance(i,Component) for i in components.values())
         self.architecture = architecture
         self.entity = entity
         self.statements = statements
         self.signals = signals
-        self.instances = instances
+        self.components = components
         self.namespace = namespace
 
     @property
@@ -151,7 +154,7 @@ class EntityBody(Scope):
         return self.entity
 
     def _get_object(self,name):
-        return self.signals.get(name,None) or self.instances.get(name,None)
+        return self.signals.get(name,None) or self.components.get(name,None)
 
 
 
