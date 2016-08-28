@@ -26,4 +26,4 @@ TODO:
 """
 
 
-from .converter import Converter, generate_testbench
+from .converter import Converter

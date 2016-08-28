@@ -42,7 +42,8 @@ class WithRegisteredMethods(type):
                     if ns > specifity:
                         specifity = ns
                         best_handler = handler
-            return best_handler
+            if best_handler is not None:
+                return best_handler
         return default
 
     @staticmethod
@@ -118,15 +119,16 @@ class NodeTransformer(metaclass=WithRegisteredMethods):
     In those cases, the original node is returned unchanged.
     """
     ExpressionNodes = (_Value,)
-    StatementNodes = (_Statement,)
-    StructuralNodes = (_Fragment,list,dict)
+    StatementNodes = (_Statement,list,tuple)
+    StatementSequence = StatementNodes + (_Fragment,list,tuple)
+    StructuralNodes = (dict,)
 
     def visit_node(self, orig, node):
         handler = type(self).find_handler('_node_visitors',node,type(self).visit_unknown_node)
         if getattr(handler,'_needs_original_node',None):
-            handler(self,orig,node)
+            return handler(self,orig,node)
         else:
-            handler(self,node)
+            return handler(self,node)
 
     def visit(self, node):
         context = type(self).find_handler('_node_context',node,type(self).context_for_unknown_node)(self,node)
@@ -136,7 +138,7 @@ class NodeTransformer(metaclass=WithRegisteredMethods):
 
     def combine(self, orig, *args, **kw):
         combiner = type(self).find_handler('_node_combiners',orig,type(self).combine_unknown_node)
-        return combiner(orig, *args, **kw)
+        return combiner(self, orig, *args, **kw)
 
     def visit_unknown_node(self, node):
         return node
@@ -248,8 +250,8 @@ class NodeTransformer(metaclass=WithRegisteredMethods):
 
     @recursor_for(_Fragment)
     def recurse_Fragment(self, node):
-        assert isinstance(node.comb,self.StructuralNodes+self.StatementNodes)
-        assert isinstance(node.sync,self.StructuralNodes+self.StatementNodes)
+        assert isinstance(node.comb,self.StatementSequence)
+        assert isinstance(node.sync,dict)   # maps clock-domains to statement sequences
         return self.combine(node,
             comb = self.visit(node.comb),
             sync = self.visit(node.sync),
@@ -261,15 +263,17 @@ class NodeTransformer(metaclass=WithRegisteredMethods):
         r.sync = sync
         return r
 
-    # NOTE: this will always return a list, even if node is a tuple
     @recursor_for(list, tuple)
-    def recurse_statements(self, node):
-        assert all(isinstance(n,self.StatementNodes) for n in node)
+    def recurse_sequence(self, node):
+        assert (
+            all(isinstance(n,self.StructuralNodes) for n in node)
+            or all(isinstance(n,self.StatementSequence) for n in node)
+        )
         return self.combine(node,[self.visit(statement) for statement in node])
 
     @recursor_for(dict)
     def recurse_clock_domains(self, node):
-        assert all(isinstance(n,self.StatementNodes) for n in node.values())
+        assert all(isinstance(n,self.StatementSequence) for n in node.values())
         return self.combine({
             clockname: self.visit(statements)
             for clockname, statements in sorted(

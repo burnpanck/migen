@@ -3,8 +3,9 @@
 """
 
 import abc
+from collections import OrderedDict
 
-from ..structure import _Statement, _Assign, _Value
+from ..structure import _Statement, _Assign, _Value, Signal
 from ..visit_generic import recursor_for, combiner_for, visitor_for
 from .explicit_migen_types import AbstractExpressionType, AbstractTypedExpression, TypeChange
 from .explicit_migen_types import NodeTransformer as ExplicitlyTypedNodeTransformer
@@ -62,17 +63,28 @@ class TestIfNonzero(TypeChange):
 # ---------------------------------------------
 # AST nodes to represent VHDL specific elements
 # ---------------------------------------------
+def _ordered_dict_by_names(dct,valuetype=None):
+    if dct is None:
+        dct = {}
+    if not isinstance(dct, dict):
+        dct = OrderedDict((v.name, v) for v in dct)
+    if not isinstance(dct, OrderedDict):
+        dct = OrderedDict(dct)
+    if valuetype is not None:
+        assert all(isinstance(v,valuetype) for v in dct.values())
+    return dct
 
 
 class VHDLSignal(AbstractTypedExpression):
-    def __init__(self,name,type,repr=None):
-        AbstractTypedExpression.__init__(type,repr)
+    def __init__(self,name,type,repr=None,reset=None):
+        super().__init__(type,repr)
         self.name = name
+        self.reset = reset
 
 class Port(VHDLSignal):
     def __init__(self,name,dir,type,repr=None):
         assert dir in ['in', 'out', 'inout', 'buffer']
-        VHDLSignal.__init__(name,type,repr)
+        super().__init__(name,type,repr)
         self.dir = dir
 
 class Scope(abc.ABC):
@@ -101,10 +113,13 @@ ReservedKeywords = DictScope({
 })
 
 class Entity(Scope):
-    def __init__(self,name,ports=[]):
-        assert all(isinstance(p,Port) for p in ports)
+    def __init__(self,name,ports=None):
         self.name = name
-        self.ports = ports
+        self.ports = _ordered_dict_by_names(ports, Port)
+
+    def _get_object(self, name):
+        return self.ports.get(name, None)
+
 
 class Component:
     # TODO: generics
@@ -128,26 +143,20 @@ class ComponentInstance(_Statement):
         self.portmap = portmap
 
 class EntityBody(Scope):
-    def __init__(self,entity,*,statements=[],architecture='Migen',signals={},components={},namespace={}):
+    def __init__(self,entity,*,statements=(),architecture='Migen',signals=None,components=None):
         """
         :param entity: The entity which is implemented in this body
         :param architecture: The architecture name
         :param signals: The local signals (ports are defined on `entity`)
         :param components: Declarations of components
-        :param namespace: Mapping of all names to their meaning inside the body.
         :param statements: The (concurrent) statements (including processes and component instantiations) contained in the body.
         """
         assert isinstance(entity,Entity)
-        assert all(isinstance(s,VHDLSignal) for s in signals.values())
-        if not isinstance(components, dict):
-            components = {c.name:c for c in components}
-        assert all(isinstance(i,Component) for i in components.values())
         self.architecture = architecture
         self.entity = entity
         self.statements = statements
-        self.signals = signals
-        self.components = components
-        self.namespace = namespace
+        self.signals = _ordered_dict_by_names(signals, VHDLSignal)
+        self.components = _ordered_dict_by_names(components, Component)
 
     @property
     def parent_scope(self):
@@ -166,6 +175,7 @@ class SelectedAssignment(_Assign):
     However, selected assignments are specially designed assignments for this purpose.
     """
     def __init__(self,*args,**kw):
+        super().__init__()
         raise NotImplementedError('SelectedAssignment')
 
 class ConditionalAssignment(_Assign):
@@ -176,6 +186,7 @@ class ConditionalAssignment(_Assign):
     However, conditional assignments are specially designed assignments for this purpose.
     """
     def __init__(self,l,default,condition_value_pairs):
+        super().__init__()
         assert all(len(v)==2 and all(isinstance(vv,_Value) for vv in v) for v in condition_value_pairs)
         self.l = l
         self.defaul = default
@@ -187,6 +198,8 @@ class ConditionalAssignment(_Assign):
 # ---------------------------------------------
 
 class NodeTransformer(ExplicitlyTypedNodeTransformer):
+    StructuralNodes = ExplicitlyTypedNodeTransformer.StructuralNodes + (Entity, EntityBody, Component)
+
     @combiner_for(TestIfNonzero)
     def combine_TestIfNonzero(self, node, expr, *, type, repr):
         assert type == Boolean()
@@ -194,16 +207,65 @@ class NodeTransformer(ExplicitlyTypedNodeTransformer):
 
     @recursor_for(ConditionalAssignment)
     def recurse_ConditionalAssignment(self, node):
+        assert isinstance(node.l,self.ExpressionNodes)
+        assert isinstance(node.default,self.ExpressionNodes)
+        assert all(
+            all(isinstance(v,self.ExpressionNodes) for v in cv)
+            for cv in node.condition_value_pairs
+        )
         return self.combine(
             node,
             self.visit(node.l),
             self.visit(node.default),
             self.visit([
-                           tuple(self.visit(v) for v in cv)
-                           for cv in node.condition_value_pairs
-                           ])
+                tuple(self.visit(v) for v in cv)
+                for cv in node.condition_value_pairs
+            ])
         )
 
     @recursor_for(SelectedAssignment)
     def recurse_SelectedAssignment(self, node):
         raise NotImplementedError('recurse_SelectedAssignment')
+
+    @recursor_for(VHDLSignal)
+    def recurse_Leaf(self, node):
+        return node
+    @combiner_for(VHDLSignal)
+    def combine_Leaf(self, orig, *args, **kw):
+        raise TypeError('Cannot rebuild leaf nodes')
+
+    @recursor_for(Entity)
+    def recurse_Entity(self, node):
+        assert isinstance(node.ports,OrderedDict)
+        assert all(isinstance(p,Port) for p in node.ports.values())
+        return self.combine(
+            node,
+            node.name,
+            ports = OrderedDict(
+                (p.name,p) for p in
+                (self.visit(p) for p in node.ports.values())
+            )
+        )
+
+    @recursor_for(EntityBody)
+    def recurse_EntityBody(self, node):
+        assert isinstance(node.statements,self.StatementSequence)
+        assert all(isinstance(s,self.StatementSequence) for s in node.statements)
+        assert isinstance(node.signals,OrderedDict)
+        assert all(isinstance(s,VHDLSignal) for s in node.signals.values())
+        assert isinstance(node.components,OrderedDict)
+        assert all(isinstance(c,Component) for c in node.components.values())
+        return self.combine(
+            node,
+            self.visit(node.entity),
+            architecture = node.architecture,
+            statements = [self.visit(s) for s in node.statements],
+            signals = OrderedDict(
+                (s.name,s) for s in
+                (self.visit(s) for s in node.signals.values())
+            ),
+            components=OrderedDict(
+                (c.name,c) for c in
+                (self.visit(c) for c in node.components.values())
+            ),
+        )

@@ -173,10 +173,10 @@ class VHDLPrinter(NodeTransformer):
             arch = node.architecture,
             entity = node.entity.name,
         )
-        for com in sorted(self.instances.values(),key=lambda c:c.name):
+        for com in node.components.values():
             header += self.visit(com)+'\n'
 
-        for sig in node.signals:
+        for sig in node.signals.values():
             header += '\t'+self._format_signal_decl(sig,True)+';\n'
 
         ret = header + 'begin\n'
@@ -187,7 +187,6 @@ class VHDLPrinter(NodeTransformer):
 
     @visitor_for(VHDLSignal)
     def visit_VHDLSignal(self, node):
-
         return node.name
 
     @combiner_for_wrapped(_Operator)

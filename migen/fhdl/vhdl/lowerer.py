@@ -8,6 +8,7 @@ from ..structure import (
 from .explicit_migen_types import *
 from .type_annotator import ExplicitTyper
 from .types import *
+from .syntax import Verilog2VHDL_operator_map
 from .ast import (
     Boolean,
     TestIfNonzero,
@@ -59,11 +60,12 @@ class ToVHDLLowerer(NodeTransformer):
     In this process, it assigns a suitable VHDL type to any expression.
     """
 
-    def __init__(self,*,vhdl_repr=natural_repr,replaced_signals={}):
+    def __init__(self,ns,*,vhdl_repr=natural_repr,replaced_signals={}):
         # configuration (constants)
         self.vhdl_repr = vhdl_repr
 
         # global variables
+        self.ns = ns
         self.replaced_signals = replaced_signals
 
         # context variables
@@ -104,11 +106,12 @@ class ToVHDLLowerer(NodeTransformer):
             name = self.ns.get_name(sig),
             type = node.type,
             repr = self.vhdl_repr.VHDL_representation_for(node.type),
+            reset = self.visit(sig.reset) if sig.reset is not None else None,
         )
         # add to replacement map
         self.replaced_signals[sig] = ret
         # add signal to entity
-        assert not ret.name in self.entity.ports
+        assert not ret.name in self.entity.entity.ports
         assert not ret.name in self.entity.signals
         self.entity.signals[ret.name] = ret
         return ret

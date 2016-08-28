@@ -1,4 +1,4 @@
-import tempfile, os, subprocess, re, shutil
+import tempfile, os, subprocess, re, shutil, itertools
 
 from migen import *
 from migen.fhdl import verilog, vhdl
@@ -32,6 +32,8 @@ class SimCase:
             for k in range(n):
                 yield
 
+        converter = vhdl.Converter()
+
         clocks = {'sys':10}
         with tempfile.TemporaryDirectory() as dir:
             # Migen simulation
@@ -43,8 +45,8 @@ class SimCase:
 
             # VHDL simulation
             tb = testbench_class()
-            out = vhdl.convert(tb)
-            out.main_source += vhdl.generate_testbench(out,clocks=clocks)
+            out = converter.convert(tb)
+            out.main_source += converter.generate_testbench(out,clocks=clocks)
             vhdlfile = os.path.join(dir,'testbench.vhd')
             out.write(vhdlfile)
             print(out)

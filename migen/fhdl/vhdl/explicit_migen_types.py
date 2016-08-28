@@ -49,6 +49,7 @@ class MigenExpressionType(AbstractExpressionType):
 
 class MigenInteger(MigenExpressionType):
     def __init__(self,width,min=None,max=None):
+        self._width = width
         if min is None:
             min = self._min
         else:
@@ -57,7 +58,6 @@ class MigenInteger(MigenExpressionType):
             max = self._max
         else:
             assert max <= self._max
-        self._width = width
         self.min = min
         self.max = max
 
@@ -116,6 +116,7 @@ class AbstractTypedExpression(_Value):
     """
     def __init__(self,type,repr=None):
         assert isinstance(type, MigenExpressionType)
+        super().__init__()
         self.type = type
         self.repr = repr
 
@@ -135,7 +136,7 @@ class MigenExpression(AbstractTypedExpression):
     """
     def __init__(self,expr,type,repr=None):
         assert isinstance(expr,_Value) and not isinstance(expr,AbstractTypedExpression)
-        AbstractTypedExpression.__init__(expr,type,repr)
+        super().__init__(type,repr)
         self.expr = expr
 
 class TypeChange(AbstractTypedExpression):
@@ -188,7 +189,7 @@ def combiner_for_wrapped(*wrapped_node_types):
         '_wrapped_node_combiners', wrapped_node_types,
     )
 
-def visitor_for_wrapped(*wrapped_node_types,needs_original_node=True):
+def visitor_for_wrapped(*wrapped_node_types,needs_original_node=False):
 
     """ Decorator to register a method to handle nodes wrapped within :py:class:`MigenExpression` nodes.
 
@@ -216,24 +217,24 @@ class NodeTransformer(NodeTranformerGeneric):
             node.expr,
             type(self).recurse_unknown_wrapped_node
         )
-        handler(self, node)
+        return handler(self, node)
 
     def recurse_unknown_wrapped_node(self,node):
         return self.combine(node,self.visit(node.expr),node.type)
 
     @combiner_for(MigenExpression)
-    def combine_Annotated(self, orig, expr, type):
+    def combine_Annotated(self, orig, expr, typ):
         """ An annotated node. Delegates to the transform's registry based on the type of the wrapped expression."""
         handler = type(self).find_handler(
             '_wrapped_node_combiners',
             orig.expr,
             type(self).combine_unknown_wrapped_node
         )
-        handler(self, orig, expr, type)
+        return handler(self, orig, expr, typ)
 
 
-    def combine_unknown_wrapped_node(self, orig, expr, type):
-        return type(orig)(expr,type)
+    def combine_unknown_wrapped_node(self, orig, expr, typ):
+        return type(orig)(expr,typ)
 
     @visitor_for(MigenExpression, needs_original_node=True)
     def visit_Annotated(self, orig, node):
@@ -244,9 +245,9 @@ class NodeTransformer(NodeTranformerGeneric):
             type(self).visit_unknown_wrapped_node
         )
         if getattr(handler, '_needs_original_node', None):
-            handler(self, orig, node)
+            return handler(self, orig, node)
         else:
-            handler(self, node)
+            return handler(self, node)
 
     def visit_unknown_wrapped_node(self,node):
         return node

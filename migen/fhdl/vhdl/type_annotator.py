@@ -42,7 +42,7 @@ class ExplicitTyper(NodeTransformer):
 
     @visitor_for(Signal)
     def visit_Signal(self, node):
-        return self.type_wrap(node,(Signed if node.signed else Unsigned)(node.nbits,min=node.min,max=node.max))
+        return self.type_wrap(node,(Signed if node.signed else Unsigned)(node.nbits))
 
     @visitor_for(ClockSignal,ResetSignal)
     def visit_BoolSignal(self, node):
@@ -51,7 +51,7 @@ class ExplicitTyper(NodeTransformer):
     @visitor_for(_Operator)
     def visit_Operator(self, node):
         from ..bitcontainer import operator_bits_sign
-        obs = [(n.type.size,isinstance(n.type,Signed)) for n in node.operands]
+        obs = [(n.type.nbits,isinstance(n.type,Signed)) for n in node.operands]
         nbits, signed = operator_bits_sign(node.op, obs)
         typ = (Signed if signed else Unsigned)(nbits)
         return self.type_wrap(node,typ)
@@ -84,7 +84,3 @@ class ExplicitTyper(NodeTransformer):
     def visit_other_Expression(self, node):
         # catch all for _Value, assume every expression is a subclass of _Value
         raise TypeError("Don't know how to generate type for expression node %s"%node)
-
-    def visit_unknown_node(self, node):
-        # most likely not an expression, just ignore.
-        return None

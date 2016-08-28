@@ -36,6 +36,10 @@ class VHDLType(abc.ABC):
     def ultimate_base(self):
         return self
 
+    @abc.abstractproperty
+    def vhdl_repr(self):
+        pass
+
 class VHDLSubtype(abc.ABC):
     """ Mixin for subtypes
     """
@@ -72,6 +76,10 @@ class VHDLInteger(VHDLScalar):
         self.right = right
         self.ascending = ascending
 
+    @property
+    def vhdl_repr(self):
+        return self.name
+
     def __str__(self):
         return '<%s:%s range %d %s %d>'%(self.name,self.ultimate_base.name,self.left,'to' if self.ascending else 'downto',self.right)
 
@@ -104,7 +112,17 @@ class VHDLInteger(VHDLScalar):
         return isinstance(other,VHDLInteger) and self.left>=other.left and self.right<=other.right and self.ascending==other.ascending
 
 class VHDLSubInteger(VHDLSubtype,VHDLInteger):
-    pass
+    @property
+    def vhdl_repr(self):
+        if self.name is not None:
+            return self.name
+        return (
+            self.base.name +
+            ' range ' +
+            str(self.left) +
+            (' to ' if self.ascending else ' downto ') +
+            str(self.right)
+        )
 
 class VHDLReal(VHDLScalar):
     pass
@@ -114,6 +132,10 @@ class VHDLEnumerated(VHDLScalar):
     def __init__(self,name,values=()):
         self.name = name
         self.values = tuple(values)
+
+    @property
+    def vhdl_repr(self):
+        return self.name
 
     def __str__(self):
         return '<%s:%s(%s)>'%(self.name,self.ultimate_base.name,', '.join(str(v) for v in self.values))
@@ -137,7 +159,9 @@ class VHDLEnumerated(VHDLScalar):
         return self.compatible_with(other)
 
 class VHDLSubEnum(VHDLSubtype,VHDLEnumerated):
-    pass
+
+    def vhdl_repr(self):
+        raise NotImplementedError
 
 class VHDLComposite(VHDLType):
     pass
@@ -148,6 +172,10 @@ class VHDLArray(VHDLComposite):
         self.name = name
         self.valuetype = valuetype
         self.indextypes = indextypes
+
+    @property
+    def vhdl_repr(self):
+        return self.name
 
     def __str__(self):
         return '<%s:%s array (%s) of %s>'%(self.name,self.ultimate_base.name,', '.join(str(v) for v in self.indextypes),self.valuetype)
@@ -207,6 +235,18 @@ class VHDLSubArray(VHDLSubtype,VHDLArray):
         self.base = base
         self.name = name
         self.indextypes = indextypes
+
+    @property
+    def vhdl_repr(self):
+        if self.name is not None:
+            return self.name
+        return (
+            self.base.name +
+            ' ( ' + ', '.join(
+                idx.vhdl_repr for idx in self.indextypes
+            ) + ' )'
+        )
+
 
     def constrain(self,name=None,*indextypes):
         raise TypeError('Cannot constrain already constrained arrays')
