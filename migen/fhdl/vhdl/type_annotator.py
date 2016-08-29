@@ -16,7 +16,15 @@ class ExplicitTyper(NodeTransformer):
         raise_on_type_mismatch: If pre-existing type annotations do not match, raise an exception rather than just replacing
         the annotation.
         """
+        # configuration (constants)
         self.raise_on_type_mismatch = raise_on_type_mismatch
+
+        # global state
+        # ... nothing
+
+        # context variables
+        # ... none
+
 
     def type_wrap(self,node,type):
         """ Annotate node with type.
@@ -42,10 +50,13 @@ class ExplicitTyper(NodeTransformer):
 
     @visitor_for(Signal)
     def visit_Signal(self, node):
+        # attention: node.reset is a :py:class:`Constant`, which possibly should be type-wrapped too.
+        # however, Signal's carry identity, so we do not want to replace it, but neither do
+        # we want to change them. Therefore, no type-wrapping for `reset`.
         return self.type_wrap(node,(Signed if node.signed else Unsigned)(node.nbits))
 
     @visitor_for(ClockSignal,ResetSignal)
-    def visit_BoolSignal(self, node):
+    def visit_NamedSignal(self, node):
         return self.type_wrap(node,Unsigned(1,min=0,max=1))
 
     @visitor_for(_Operator)

@@ -107,6 +107,7 @@ class Signed(MigenInteger):
 # AST expression node that contains explicit type information
 # -----------------------------------------------------------
 
+_type = type
 class AbstractTypedExpression(_Value):
     """ AST node with explicit type information.
 
@@ -115,7 +116,8 @@ class AbstractTypedExpression(_Value):
     for a particular backend.
     """
     def __init__(self,type,repr=None):
-        assert isinstance(type, MigenExpressionType)
+        if not isinstance(type, AbstractExpressionType):
+            raise TypeError('type must be a AbstractExpressionType, instead got "%s"'%_type(type).__name__)
         super().__init__()
         self.type = type
         self.repr = repr

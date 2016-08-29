@@ -2,8 +2,8 @@
 
 from ..structure import (
     Constant, Signal, ClockSignal, ResetSignal,
-    _Operator,
-    If,
+    _Operator, _Value, _Slice, _Assign,
+    Cat, Replicate, If,
 )
 from .explicit_migen_types import *
 from .type_annotator import ExplicitTyper
@@ -79,18 +79,40 @@ class VHDLPrinter(NodeTransformer):
             # direct child of a type wrapper: replace combine call by
             wrapnode = self.ancestry[-2]
             combiner = type(self).find_handler('_wrapped_node_combiners',orig,type(self).combine_unknown_wrapped_node)
-            return combiner(wrapnode, *args, **kw)
+            return combiner(self, wrapnode, *args, **kw)
         combiner = type(self).find_handler('_node_combiners',orig,type(self).combine_unknown_node)
-        return combiner(orig, *args, **kw)
+        return combiner(self,orig, *args, **kw)
 
-    def recurse_unknown_wrapped_node(self,node):
-        # TODO: what to do here?
-        return self.visit(node.expr)
+    # ----- ensure we never receive an actual node from recursion
+    def combine_unknown_node(self,node,*args,**kw):
+        raise NotImplementedError('VHDLPrinter has to override all combiners, missing combiner for "%s"'%type(node).__name__)
 
-    @visitor_for_wrapped(Constant)
-    def visit_Constant(self, node):
-        printer = literal_printers[node.repr]
-        return printer(node.expr.value)
+    @combiner_for(_Value)
+    def combine_unwrapped_expr_node(self,node,*args,**kw):
+        raise TypeError('Attempting to visit non-type-wrapped node "%s"! All implicitely typed nodes must be wrapped, e.g. using ExplicitTyper'%type(node).__name__)
+
+    @recursor_for(Constant,Signal,ResetSignal,ClockSignal)
+    def recurse_leaf(self,node):
+        raise TypeError('Attempting to visit non-type-wrapped node "%s"! All implicitely typed nodes must be wrapped, e.g. using ExplicitTyper'%type(node).__name__)
+
+    def combine_unknown_wrapped_node(self,wrapnode,*args,**kw):
+        raise NotImplementedError('VHDLPrinter has to override all combiners, missing combiner for wrapped "%s"'%type(wrapnode.expr).__name__)
+    # -----
+
+    @combiner_for(MigenExpression)
+    def combine_Annotated(self, node, expr, type):
+        return expr
+
+    @recursor_for_wrapped(Constant)
+    def visit_Constant(self, wrapnode):
+        repr = wrapnode.repr
+        printer = literal_printers[repr.ultimate_base]
+        if isinstance(repr, VHDLArray):
+            idx, = repr.indextypes
+            n = idx.length
+        else:
+            n = None
+        return printer(wrapnode.expr.value, n)
 
     @combiner_for(TypeChange)
     def combine_TypeChange(self, node, expr, *, type=None, repr=None):
@@ -113,14 +135,14 @@ class VHDLPrinter(NodeTransformer):
             return conv(nrepr, expr, orepr)
         if not isinstance(orepr,VHDLArray) or not isinstance(nrepr,VHDLArray):
             raise TypeError('Unknown conversion between integer representations %s and %s' % (orepr, nrepr))
-        if not nrepr.ulimate_base == orepr.ultimate_base:
+        if not nrepr.ultimate_base == orepr.ultimate_base:
             raise TypeError('Unknown conversion between integer representations %s and %s' % (orepr, nrepr))
         # simply assume the presence of a resize function
-        expr = 'resize('+expr+','+str(type.indextypes[0].length)+')'
-        if not orepr.valuetype.compatible_with(type.valuetype):
-            assert orepr.castable_to(type.valuetype)
-            assert type.name is not None
-            expr = type.name+'('+expr+')'
+        expr = 'resize('+expr+','+str(nrepr.indextypes[0].length)+')'
+        if not orepr.valuetype.compatible_with(nrepr.valuetype):
+            assert orepr.castable_to(nrepr.valuetype)
+            assert nrepr.name is not None
+            expr = nrepr.name+'('+expr+')'
         return expr
 
     @visitor_for(TestIfNonzero, needs_original_node=True)
@@ -136,15 +158,14 @@ class VHDLPrinter(NodeTransformer):
     def visit_Signal(self, node):
         raise TypeError("Bare Migen signals should be replaced with VHDLSignals first: "+str(node.expr))
 
-    @visitor_for(Port)
-    def visit_Port(self, node):
-        raise NotImplementedError
-
     def _format_signal_decl(self, sig, initialise=False):
         ret = sig.name + ': ' + sig.repr.vhdl_repr
         if initialise:
-            ret += ' := ' + self.visit(sig.reset)
+            ret += ' := ' + str(sig.reset)
         return ret
+
+    def _format_port_decl(self, port):
+        return port.name + ': ' + port.dir + ' ' + port.repr.vhdl_repr
 
     @recursor_for(Component)
     def recurse_Component(self, node):
@@ -155,7 +176,7 @@ class VHDLPrinter(NodeTransformer):
             "end component;\n"
         ).format(
             name=node.name,
-            ports=','.join('\n\t\t' + self.visit(p) for p in node.ports) + ('\n\t' if node.ports else '')
+            ports=','.join('\n\t\t' + self._format_port_decl(p) for p in node.ports) + ('\n\t' if node.ports else '')
         )
 
     @recursor_for(ComponentInstance)
@@ -164,7 +185,7 @@ class VHDLPrinter(NodeTransformer):
         return "{instname}: {componentname} port map ({ports});".format(
             instname=node.name,
             componentname=node.component.name,
-            ports=','.join('\n\t{port} => {signal}' + self.visit() for k,v in node.portmap.items()) + ('\n' if node.ports else '')
+            ports=','.join('\n\t{port} => {signal}'.format(k,self.visit(v)) for k,v in node.portmap.items()) + ('\n' if node.portmap else '')
         )
 
     @recursor_for(EntityBody)
@@ -180,7 +201,7 @@ class VHDLPrinter(NodeTransformer):
             header += '\t'+self._format_signal_decl(sig,True)+';\n'
 
         ret = header + 'begin\n'
-        for stmt in self.statements:
+        for stmt in node.statements:
             ret += self.visit(stmt)
         ret += 'end\n'
         return ret
@@ -203,15 +224,17 @@ class VHDLPrinter(NodeTransformer):
         else:
             raise TypeError('Unknown operator "%s" with %d operands'%(node.op,len(node.operands)))
 
-    def visit_Slice(self, node):
-        expr,type = self.visit(node.value)
-        if not isinstance(type,VHDLArray):
+    @combiner_for_wrapped(_Slice)
+    def combine_Slice(self, wrapnode, expr, start ,stop):
+        repr = wrapnode.repr
+        if not isinstance(repr,VHDLArray):
             raise TypeError('Cannot slice value of non-array type %s'%type)
-        idx, = type.indextypes
-        if node.stop - node.start == 1:
+        idx, = repr.indextypes
+        # TODO: should we check that the index is of integer type?
+        if stop - start == 1:
             # this is not a slice, but an indexing operation!
-            return expr + '(' + str(node.start) + ')', type.valuetype
-        return expr + '(' + str(node.stop-1) + ' downto ' + str(node.start) + ')', type.ultimate_base[node.stop-1:node.start]
+            return expr + '(' + str(start) + ')'
+        return expr + '(' + str(stop-1) + ' downto ' + str(start) + ')'
 
     def visit_Cat(self, node):
         pieces = []
@@ -233,8 +256,11 @@ class VHDLPrinter(NodeTransformer):
     def visit_Replicate(self, node):
         raise NotImplementedError(type(self).__name__+'.visit_Replicate')
 
-    def visit_Assign(self, node):
-        return self._cannot_visit(node)
+    @combiner_for(_Assign)
+    def combine_Assign(self, node, l, r):
+        # concurrent assignment,
+        # we do not support variables, only signals
+        return l + ' <= ' + r + ';'
 
     def visit_If(self, node):
         return self._cannot_visit(node)
@@ -281,11 +307,19 @@ class VHDLPrinter(NodeTransformer):
     def visit_Fragment(self, node):
         return self._cannot_visit(node)
 
-    def visit_statements(self, node):
-        return self._cannot_visit(node)
+    @combiner_for(list,tuple)
+    def combine_statements(self, node ,statements):
+        return '\n'.join(statements)
 
-    def visit_clock_domains(self, node):
-        return self._cannot_visit(node)
+    @combiner_for(dict)
+    def combine_clock_domains(self, node, cd):
+        r = ""
+        for k, v in sorted(cd.items(), key=lambda kv:kv[0]):
+            clk = k # TODO: fix #ns.get_name(f.clock_domains[k].clk)
+            r += k + '_' + k + ": process ({clk})\nbegin\nif rising_edge({clk}) then\n".format(clk=clk)
+            r += v
+            r += "end if;end process;\n\n"
+        return r
 
     def visit_ArrayProxy(self, node):
         raise NotImplementedError(type(self).__name__+'.visit_ArrayProxy')

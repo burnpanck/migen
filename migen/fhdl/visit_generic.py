@@ -1,6 +1,7 @@
 from copy import copy
 from operator import itemgetter
 from contextlib import contextmanager
+from collections import defaultdict
 
 from migen.fhdl.structure import *
 from migen.fhdl.structure import (_Operator, _Slice, _Assign, _ArrayProxy,
@@ -186,10 +187,10 @@ class NodeTransformer(metaclass=WithRegisteredMethods):
                 raise RuntimeError('Could not revert context variables: '+str(fail))
 
     @recursor_for(Constant, Signal, ClockSignal, ResetSignal)
-    def recurse_Leaf(self, node):
+    def recurse_leaf(self, node):
         return node
     @combiner_for(Constant, Signal, ClockSignal, ResetSignal)
-    def combine_Leaf(self, orig, *args, **kw):
+    def combine_leaf(self, orig, *args, **kw):
         raise TypeError('Cannot rebuild leaf nodes')
 
     @recursor_for(_Operator)
@@ -274,13 +275,18 @@ class NodeTransformer(metaclass=WithRegisteredMethods):
     @recursor_for(dict)
     def recurse_clock_domains(self, node):
         assert all(isinstance(n,self.StatementSequence) for n in node.values())
-        return self.combine({
+        return self.combine(node, {
             clockname: self.visit(statements)
             for clockname, statements in sorted(
                 node.items(),
                 key=itemgetter(0)
             )
         })
+    @combiner_for(dict)
+    def combine_clock_domains(self, node, cd):
+        if isinstance(node, defaultdict):
+            return defaultdict(list, cd)
+        return type(node)(cd)
 
     @recursor_for(_ArrayProxy)
     def recurse_ArrayProxy(self, node):

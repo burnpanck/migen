@@ -1,6 +1,6 @@
 
 from ..structure import (
-    Signal, ClockSignal, ResetSignal,
+    Signal, ClockSignal, ResetSignal, Constant,
     _Operator,
     If,
     _Slice, Cat, Replicate,
@@ -102,11 +102,15 @@ class ToVHDLLowerer(NodeTransformer):
             # TODO: should we again check if the type in this wrapper conforms to the replacement signal?
             return repl
         # this Signal does not yet have a replacement.
+        assert isinstance(sig.reset, Constant)
+        repr = self.vhdl_repr.VHDL_representation_for(node.type)
+        reset = MigenExpression(sig.reset,type=node.type,repr=repr)
+        # TODO: what if the reset value is outside of the range of the node.type? => probably just leave it as undefined behaviour
         ret = VHDLSignal(
             name = self.ns.get_name(sig),
             type = node.type,
-            repr = self.vhdl_repr.VHDL_representation_for(node.type),
-            reset = self.visit(sig.reset) if sig.reset is not None else None,
+            repr = repr,
+            reset = reset,
         )
         # add to replacement map
         self.replaced_signals[sig] = ret
