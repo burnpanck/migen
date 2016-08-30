@@ -124,21 +124,36 @@ class ToVHDLLowerer(NodeTransformer):
     def visit_Operator(self, node):
         expr = node.expr
         repr = node.repr
+        assert all(
+            isinstance(v.type, MigenInteger)
+            for v in expr.operands
+        )  # only Migen semantics are implemented
         op = Verilog2VHDL_operator_map[expr.op]  # TODO: op=='m'
         if op in {
             'and', 'or', 'nand', 'nor', 'xor', 'xnor', # logical operators
             'not',                                     # unary logical operators
             '+', '-',                                  # addition operators (two operands)
-            '<', '<=', '=', '/=', '>', '>=',           # relational operators
             '+', '-',                                  # unary operators (one operand)
         }:
-            assert all(
-                isinstance(v.type, MigenInteger)
-                for v in expr.operands
-            ) # only Migen semantics are implemented
             # VHDL and migen semantics match as long as the input types match
             # and are either signed or unsigned
             migen_repr = only_numeric.VHDL_representation_for(node.type)
+            expr.operands = [
+                TypeChange.if_needed(v,repr=migen_repr)
+                for v in
+                expr.operands
+            ]
+            return TypeChange.if_needed(node,repr=repr)
+        elif op in {'<', '<=', '=', '/=', '>', '>='}:
+            # relational operators
+            migen_repr = (
+                signed
+                if any(isinstance(v.type, Signed) for v in expr.operands) else
+                unsigned
+            )[max(
+                v.type.nbits + (1 if isinstance(v.type, Signed) else 0)
+                for v in expr.operands
+            )-1:0]
             expr.operands = [
                 TypeChange.if_needed(v,repr=migen_repr)
                 for v in
@@ -188,7 +203,10 @@ class ToVHDLLowerer(NodeTransformer):
     def visit_If(self, node):
         # make implicit test explicit
         if not isinstance(node.cond.type,Boolean):
-            node.cond = TestIfNonzero(node.cond)
+            node.cond = TestIfNonzero(
+                TypeChange.if_needed(node.cond,repr=integer),
+                repr=boolean
+            )
         return node
 
     @visitor_for(TestIfNonzero)

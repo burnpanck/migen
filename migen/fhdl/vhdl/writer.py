@@ -1,9 +1,9 @@
 
 
 from ..structure import (
+    _Value, _Operator, _Slice, Cat, Replicate,
     Constant, Signal, ClockSignal, ResetSignal,
-    _Operator, _Value, _Slice, _Assign,
-    Cat, Replicate, If,
+    _Statement, _Assign, If,
 )
 from .explicit_migen_types import *
 from .type_annotator import ExplicitTyper
@@ -87,6 +87,10 @@ class VHDLPrinter(NodeTransformer):
     def combine_unknown_node(self,node,*args,**kw):
         raise NotImplementedError('VHDLPrinter has to override all combiners, missing combiner for "%s"'%type(node).__name__)
 
+    @combiner_for(_Statement)
+    def combine_unknown_statement(self,node,*args,**kw):
+        raise NotImplementedError('VHDLPrinter has to override all combiners, missing combiner for "%s"'%type(node).__name__)
+
     @combiner_for(_Value)
     def combine_unwrapped_expr_node(self,node,*args,**kw):
         raise TypeError('Attempting to visit non-type-wrapped node "%s"! All implicitely typed nodes must be wrapped, e.g. using ExplicitTyper'%type(node).__name__)
@@ -119,7 +123,7 @@ class VHDLPrinter(NodeTransformer):
         return expr
 
     @combiner_for(TypeChange)
-    def visit_TypeChange(self, orig, expr, *, type=None, repr=None):
+    def combine_TypeChange(self, orig, expr, *, type=None, repr=None):
         ntype = orig.type if type is None else type
         nrepr = orig.repr if repr is None else repr
         otype = orig.expr.type
@@ -129,7 +133,7 @@ class VHDLPrinter(NodeTransformer):
         # depend on the interpretation of the representation.
         if not isinstance(ntype, MigenInteger) or not isinstance(otype, MigenInteger):
             # so far, only conversions between MigenInteger is supported
-            raise TypeError('Undefined (representation) conversion between types %s and %s' % (otype, ntype))
+            raise TypeError('Undefined conversion between types %s and %s' % (otype, ntype))
         conv = integer_repr_converters.get((nrepr.ultimate_base, orepr.ultimate_base))
         if conv is not None:
             return conv(nrepr, expr, orepr)
@@ -145,11 +149,11 @@ class VHDLPrinter(NodeTransformer):
             expr = nrepr.name+'('+expr+')'
         return expr
 
-    @visitor_for(TestIfNonzero, needs_original_node=True)
-    def visit_TestIfNonzero(self, orig, expr):
+    @combiner_for(TestIfNonzero)
+    def combine_TestIfNonzero(self, orig, expr, *, type, repr):
         if not (
             (orig.expr.repr.ultimate_base == integer)
-            and (orig.repr == bool)
+            and (repr == boolean)
         ):
             raise TypeError('VHDL TestIfNonzero works only on integer and returns boolean')
         return '('+expr + ' /= 0)'
@@ -228,7 +232,12 @@ class VHDLPrinter(NodeTransformer):
     def combine_Slice(self, wrapnode, expr, start ,stop):
         repr = wrapnode.repr
         if not isinstance(repr,VHDLArray):
-            raise TypeError('Cannot slice value of non-array type %s'%type)
+            # single-bit signals will not necessarily be represented by arrays
+            # nonetheless does Migen allow them to be sliced
+            if start != 0 or stop != 1:
+                raise TypeError('Cannot slice value of non-array type %s to [%d:%d]'%(repr,start,stop))
+            # TODO: should we check that representations actually match?
+            return expr
         idx, = repr.indextypes
         # TODO: should we check that the index is of integer type?
         if stop - start == 1:
@@ -262,8 +271,13 @@ class VHDLPrinter(NodeTransformer):
         # we do not support variables, only signals
         return l + ' <= ' + r + ';'
 
-    def visit_If(self, node):
-        return self._cannot_visit(node)
+    @combiner_for(If)
+    def combine_If(self, node, cond, t, f):
+        ret = 'if '+cond+' then\n'+t
+        if f:
+            ret += 'else\n'+f
+        ret += 'end if;\n'
+        return ret
 
     def _printnode(self, ns, level, node):
         if isinstance(node, _Assign):

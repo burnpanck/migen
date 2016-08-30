@@ -145,8 +145,14 @@ class TypeChange(AbstractTypedExpression):
     """ Replaces the representation and semantics of a type while preserving the
     represented value.
 
-    Note that this might involve some logic in the underlying represenation or might
+    This might involve some logic in the underlying represenation or might
     simply be a type cast for the underlying representation.
+
+    Note that the behaviour is undefined for values not in the set specified
+    by the semantical type or not representable in the requested representation.
+    In particular, do not rely on this node to erase bits from the input,
+    optimisers are allowed to remove this node in certain cases.
+    Use a simple slice instead.
     """
 
     def __init__(self, expr, *, type=None, repr=None):
