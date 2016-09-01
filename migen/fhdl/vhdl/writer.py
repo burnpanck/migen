@@ -230,7 +230,7 @@ class VHDLPrinter(NodeTransformer):
 
     @combiner_for_wrapped(_Slice)
     def combine_Slice(self, wrapnode, expr, start ,stop):
-        repr = wrapnode.repr
+        repr = wrapnode.expr.value.repr
         if not isinstance(repr,VHDLArray):
             # single-bit signals will not necessarily be represented by arrays
             # nonetheless does Migen allow them to be sliced
@@ -245,7 +245,8 @@ class VHDLPrinter(NodeTransformer):
             return expr + '(' + str(start) + ')'
         return expr + '(' + str(stop-1) + ' downto ' + str(start) + ')'
 
-    def visit_Cat(self, node):
+    @combiner_for_wrapped(Cat)
+    def combine_Cat(self, wrapnode, l):
         pieces = []
         nbits = 0
         for o in node.l:
