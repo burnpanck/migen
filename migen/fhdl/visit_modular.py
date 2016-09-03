@@ -70,6 +70,21 @@ class WithRegisteredMethods(CollaborativeMetaclass):
 
     Use :py:meth:`find_handler` to walk a registry to find a maching method.
     """
+    def __new__(mcs, name, bases, dct):
+        ret = super().__new__(mcs, name, bases, dct)
+        opts = {}
+        for c in ret.mro():
+            o = getattr(c,'default_visitor_options',None)
+            if o is None:
+                continue
+            if isinstance(o,VisitingOptions):
+                o = o.all_options
+            opts.update((k,v) for k,v in o.items() if v is not None)
+        ret.default_visitor_options = VisitingOptions(**opts)
+        ret.default_visitor_options.validate()
+        return ret
+
+
     def find_handler(cls,registry,node,default=None):
         """ Find a handler function in the ancestry of this class for the given node. """
         node_mro = list(reversed(type(node).mro()))
@@ -127,7 +142,7 @@ class VisitingOptions:
         opts = type(self)._options.get(attr)
         if opts is None:
             raise AttributeError('Cannot set attribute "%s"'%attr)
-        if value not in opts:
+        if value not in opts and value is not None:
             raise ValueError('Attribute "%s" must be one of %s, got "%s" instead'%(attr,opts,repr(value)))
         super().__setattr__(attr,value)
 
@@ -145,8 +160,9 @@ def update_from_bases(**options):
         # TODO: mirror python's MRO
         for base in dct.bases:
             prev = getattr(base,key,None)
-            if prev is not None:
-                break
+            if prev is None:
+                continue
+            prev = prev.all_options
         else:
             prev = {}
         prev.update(options)
@@ -158,7 +174,17 @@ def update_from_bases(**options):
 def visitor_for(*node_types,**options):
     """ Decorator marking a method of a NodeTransformer to handle a set of node types.
     """
-    options = VisitingOptions(**options)
+    registry_name = '_node_visitors'
+
+    def registerer(dct, key, fun):
+        registry = dct.setdefault(registry_name, {})
+        for node in node_types:
+            registry[node] = fun
+        dct[key] = fun
+
+    def decorate(fun):
+        return RegisteringFunc(registerer, fun=fun)
+
     return WithRegisteredMethods.registering_decorator(
         '_node_visitors',node_types,
         _options=options,
@@ -404,7 +430,7 @@ class AssertConformingTree(TreeVisitor):
 
     # TODO: refactor visitors to work with supply_recursed=False,
     # since conceptually, recursion is completely independent of the visitation
-    default_visitor_options = update_from_bases(
+    default_visitor_options = dict(
         return_value = 'orig',
         recurse='before',
         supply_orig=True,
